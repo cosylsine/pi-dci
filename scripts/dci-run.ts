@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent, type AgentEvent, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
@@ -27,8 +29,10 @@ const DEFAULT_CONTRACT = {
 	maxFinalRepairTurns: 3,
 	sampleTimeoutSeconds: 600,
 	toolResultMaxChars: 20_000,
+	maxScratchBytes: 20_000_000,
 	maxTotalModelTokens: 128_000,
 	maxFinalOutputTokens: 1_024,
+	maxCorpusDocumentBytes: 1_000_000,
 	systemPrompt: `/no_think
 You are the DCI-Bench retrieval agent.
 
@@ -55,6 +59,7 @@ Rules:
 };
 
 type Args = {
+	preflightOnly: boolean;
 	queryFile: string;
 	workspace: string;
 	output: string;
@@ -121,10 +126,12 @@ function parseArgs(argv: string[]): Args {
 		if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`--${key} must be a positive integer`);
 		return parsed;
 	};
+	const preflightOnly = values.has("preflight-only");
 	return {
-		queryFile: required("query-file"),
+		preflightOnly,
+		queryFile: preflightOnly ? "" : required("query-file"),
 		workspace: required("workspace"),
-		output: required("output"),
+		output: preflightOnly ? "" : required("output"),
 		trace: typeof values.get("trace") === "string" ? String(values.get("trace")) : undefined,
 		modelProvider: values.get("mock-script") ? "mock" : "bridge",
 		mockScript: typeof values.get("mock-script") === "string" ? String(values.get("mock-script")) : undefined,
@@ -155,6 +162,219 @@ const bashSchema = Type.Object(
 function truncate(text: string): string {
 	if (text.length <= DEFAULT_CONTRACT.toolResultMaxChars) return text;
 	return `${text.slice(0, DEFAULT_CONTRACT.toolResultMaxChars)}\n[truncated]`;
+}
+
+async function directoryUsageBytes(root: string): Promise<number> {
+	let total = 0;
+	const pending = [root];
+	while (pending.length > 0) {
+		const directory = pending.pop();
+		if (!directory) continue;
+		let entries;
+		try {
+			entries = await readdir(directory, { withFileTypes: true });
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? error.code : undefined;
+			if (code === "ENOENT") continue;
+			throw error;
+		}
+		for (const entry of entries) {
+			const path = join(directory, entry.name);
+			let info;
+			try {
+				info = await lstat(path);
+			} catch (error) {
+				const code = error instanceof Error && "code" in error ? error.code : undefined;
+				if (code === "ENOENT") continue;
+				throw error;
+			}
+			total += Math.max(info.size, info.blocks * 512);
+			if (total > DEFAULT_CONTRACT.maxScratchBytes) return total;
+			if (info.isDirectory() && !info.isSymbolicLink()) pending.push(path);
+		}
+	}
+	return total;
+}
+
+async function findExecutable(name: string): Promise<string | undefined> {
+	for (const directory of (process.env.PATH ?? "/usr/bin:/bin").split(":")) {
+		if (!directory) continue;
+		const candidate = join(directory, name);
+		try {
+			await access(candidate, fsConstants.X_OK);
+			return await realpath(candidate);
+		} catch {
+			// Try the next PATH entry.
+		}
+	}
+	return undefined;
+}
+
+async function validateTrustedExecutable(path: string, label: string): Promise<string> {
+	const canonical = await realpath(path);
+	const info = await stat(canonical);
+	if (!info.isFile() || info.uid !== 0 || (info.mode & 0o022) !== 0) {
+		throw new Error(`${label} must resolve to a root-owned executable that is not group/world writable: ${canonical}`);
+	}
+	await access(canonical, fsConstants.X_OK);
+	return canonical;
+}
+
+type CorpusSandbox = {
+	workspace: string;
+	corpus: string;
+	bwrap: string;
+	rg?: string;
+};
+
+async function validateCorpusSandbox(workspace: string): Promise<CorpusSandbox> {
+	const resolvedWorkspace = await realpath(workspace);
+	const corpus = resolve(resolvedWorkspace, "corpus");
+	const corpusInfo = await lstat(corpus);
+	if (corpusInfo.isSymbolicLink() || !corpusInfo.isDirectory()) {
+		throw new Error(`Corpus must be a real directory: ${corpus}`);
+	}
+	for (const entry of await readdir(corpus, { withFileTypes: true })) {
+		if (entry.isSymbolicLink() || !entry.isFile()) {
+			throw new Error(`Corpus entries must be regular files, found: ${entry.name}`);
+		}
+		if (!entry.name.endsWith(".md")) {
+			throw new Error(`Corpus entries must be markdown files, found: ${entry.name}`);
+		}
+		const entryInfo = await lstat(join(corpus, entry.name));
+		if (entryInfo.nlink !== 1) {
+			throw new Error(`Corpus entries must not be hard links, found: ${entry.name}`);
+		}
+		if (entryInfo.size > DEFAULT_CONTRACT.maxCorpusDocumentBytes) {
+			throw new Error(`Corpus document exceeds the size limit: ${entry.name}`);
+		}
+	}
+	try {
+		await access("/usr/bin/bwrap", fsConstants.X_OK);
+	} catch {
+		throw new Error("bubblewrap is required for corpus isolation; install it with: apt install -y bubblewrap");
+	}
+	const bwrap = await validateTrustedExecutable("/usr/bin/bwrap", "bubblewrap");
+	if (bwrap !== "/usr/bin/bwrap") {
+		throw new Error(`bubblewrap must resolve to the expected system path: ${bwrap}`);
+	}
+	const rgCandidate = await findExecutable("rg");
+	let rg: string | undefined;
+	if (rgCandidate) {
+		try {
+			rg = await validateTrustedExecutable(rgCandidate, "ripgrep");
+		} catch {
+			// grep remains available from the read-only system mount.
+		}
+	}
+	return { workspace: resolvedWorkspace, corpus: await realpath(corpus), bwrap, rg };
+}
+
+function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): string[] {
+	const args = [
+		"--unshare-user",
+		"--uid",
+		"65534",
+		"--gid",
+		"65534",
+		"--unshare-pid",
+		"--unshare-net",
+		"--unshare-ipc",
+		"--unshare-uts",
+		"--new-session",
+		"--die-with-parent",
+		"--cap-drop",
+		"ALL",
+		"--hostname",
+		"dci-sample",
+		"--dir",
+		"/usr",
+		"--ro-bind",
+		"/usr/bin",
+		"/usr/bin",
+		"--ro-bind",
+		"/usr/lib",
+		"/usr/lib",
+		"--ro-bind",
+		"/usr/lib64",
+		"/usr/lib64",
+		"--symlink",
+		"usr/bin",
+		"/bin",
+		"--symlink",
+		"usr/lib",
+		"/lib",
+		"--symlink",
+		"usr/lib64",
+		"/lib64",
+		"--dev",
+		"/dev",
+		"--dir",
+		"/workspace",
+		"--ro-bind",
+		sandbox.corpus,
+		"/workspace/corpus",
+		"--bind",
+		scratch,
+		"/scratch",
+		"--dir",
+		"/sandbox-bin",
+	];
+	if (sandbox.rg) args.push("--ro-bind", sandbox.rg, "/sandbox-bin/rg");
+	args.push(
+		"--chdir",
+		"/workspace",
+		"--setenv",
+		"PATH",
+		"/sandbox-bin:/usr/bin:/bin",
+		"--setenv",
+		"HOME",
+		"/scratch",
+		"--setenv",
+		"DCI_WORKSPACE",
+		"/workspace",
+		"--setenv",
+		"DCI_CORPUS",
+		"/workspace/corpus",
+		"--setenv",
+		"DCI_SCRATCH",
+		"/scratch",
+		"--setenv",
+		"TMPDIR",
+		"/scratch/tmp",
+		"/bin/bash",
+		"--noprofile",
+		"--norc",
+		"-c",
+		"umask 077 && ulimit -S -n 256 && ulimit -H -n 256 && ulimit -S -u 128 && ulimit -H -u 128 && ulimit -S -f 2048 && ulimit -H -f 2048 && ulimit -S -v 1048576 && ulimit -H -v 1048576 && ulimit -S -t 60 && ulimit -H -t 60 && exec /bin/bash --noprofile --norc -c \"$1\"",
+		"dci-sandbox",
+		command,
+	);
+	return args;
+}
+
+async function runSandboxPreflight(sandbox: CorpusSandbox): Promise<void> {
+	const scratch = await mkdtemp(join(tmpdir(), "dci-bench-preflight-"));
+	try {
+		await mkdir(join(scratch, "tmp"), { mode: 0o700 });
+		const command =
+			"test -r /workspace/corpus && test ! -e /mnt && test ! -e /root && test ! -e /proc && test ! -e /tmp && test -w /scratch && test -w \"$TMPDIR\"";
+		const result = await new Promise<{ code: number; stderr: string }>((resolvePromise, reject) => {
+			const proc = spawn(sandbox.bwrap, sandboxArgs(sandbox, scratch, command), {
+				env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
+				stdio: ["ignore", "ignore", "pipe"],
+			});
+			const stderr: Buffer[] = [];
+			proc.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+			proc.on("error", reject);
+			proc.on("close", (code) => resolvePromise({ code: code ?? -1, stderr: Buffer.concat(stderr).toString("utf8") }));
+		});
+		if (result.code !== 0) {
+			throw new Error(`bubblewrap corpus sandbox preflight failed: ${result.stderr.trim() || `exit ${result.code}`}`);
+		}
+	} finally {
+		await rm(scratch, { recursive: true, force: true });
+	}
 }
 
 type EvidenceState = {
@@ -204,25 +424,24 @@ function parsePseudoToolCall(text: string): ToolCall | undefined {
 	return undefined;
 }
 
-function resolveWorkspacePath(workspace: string, requested: string): string {
-	const mapped = requested === "/workspace" || requested.startsWith("/workspace/")
-		? `${workspace}${requested.slice("/workspace".length)}`
+async function resolveCorpusPath(sandbox: CorpusSandbox, requested: string): Promise<string> {
+	const mapped = requested === "/workspace/corpus" || requested.startsWith("/workspace/corpus/")
+		? `${sandbox.corpus}${requested.slice("/workspace/corpus".length)}`
 		: requested;
-	const full = mapped.startsWith("/") ? resolve(mapped) : resolve(workspace, mapped);
-	const workspaceRoot = resolve(workspace);
-	if (full !== workspaceRoot && !full.startsWith(`${workspaceRoot}/`)) {
-		throw new Error(`Path escapes workspace: ${requested}`);
+	const full = mapped.startsWith("/") ? resolve(mapped) : resolve(sandbox.workspace, mapped);
+	if (full !== sandbox.corpus && !full.startsWith(`${sandbox.corpus}${sep}`)) {
+		throw new Error(`Path escapes corpus: ${requested}`);
 	}
-	return full;
+	const info = await lstat(full);
+	if (info.isSymbolicLink()) throw new Error(`Symlinks are not allowed in corpus reads: ${requested}`);
+	const canonical = await realpath(full);
+	if (canonical !== sandbox.corpus && !canonical.startsWith(`${sandbox.corpus}${sep}`)) {
+		throw new Error(`Path escapes corpus after symlink resolution: ${requested}`);
+	}
+	return canonical;
 }
 
-function rewriteLocalSandboxCommand(command: string, workspace: string, scratch: string): string {
-	return command
-		.replace(/\/workspace/g, workspace)
-		.replace(/\/scratch/g, scratch);
-}
-
-function createReadTool(workspace: string, evidence: EvidenceState): AgentTool<typeof readSchema> {
+function createReadTool(sandbox: CorpusSandbox, evidence: EvidenceState): AgentTool<typeof readSchema> {
 	return {
 		name: "read",
 		label: "read",
@@ -231,25 +450,36 @@ function createReadTool(workspace: string, evidence: EvidenceState): AgentTool<t
 		executionMode: "sequential",
 		prepareArguments: (args) => Value.Parse(readSchema, args),
 		execute: async (_toolCallId, params) => {
-			const path = resolveWorkspacePath(workspace, params.path);
+			const path = await resolveCorpusPath(sandbox, params.path);
 			const info = await stat(path);
 			if (info.isDirectory()) {
 				const entries = (await readdir(path)).sort();
 				const text = truncate(entries.join("\n"));
-				return { content: [{ type: "text", text }], details: { path, entries: entries.length, bodyEvidence: false } };
+				return {
+					content: [{ type: "text", text }],
+					details: { path: "/workspace/corpus", entries: entries.length, bodyEvidence: false },
+				};
+			}
+			if (!info.isFile()) throw new Error(`Corpus read requires a regular file: ${params.path}`);
+			if (info.nlink !== 1) throw new Error(`Corpus read rejects hard-linked files: ${params.path}`);
+			if (info.size > DEFAULT_CONTRACT.maxCorpusDocumentBytes) {
+				throw new Error(`Corpus document exceeds the size limit: ${params.path}`);
 			}
 			const raw = await readFile(path, "utf8");
 			const offset = Math.max(0, Math.floor(params.offset ?? 0));
 			const limit = Math.max(1, Math.floor(params.limit ?? DEFAULT_CONTRACT.toolResultMaxChars));
 			const text = truncate(raw.slice(offset, offset + limit));
-			const relativePath = workspaceRelativePath(workspace, path);
+			const relativePath = workspaceRelativePath(sandbox.workspace, path);
 			evidence.bodyReadFiles.add(relativePath);
-			return { content: [{ type: "text", text }], details: { path, bytes: Buffer.byteLength(text), bodyEvidence: true } };
+			return {
+				content: [{ type: "text", text }],
+				details: { path: `/workspace/${relativePath}`, bytes: Buffer.byteLength(text), bodyEvidence: true },
+			};
 		},
 	};
 }
 
-function createBashTool(workspace: string, scratch: string, evidence: EvidenceState): AgentTool<typeof bashSchema> {
+function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence: EvidenceState): AgentTool<typeof bashSchema> {
 	return {
 		name: "bash",
 		label: "bash",
@@ -263,28 +493,88 @@ function createBashTool(workspace: string, scratch: string, evidence: EvidenceSt
 			const timeout = setTimeout(() => controller.abort(), timeoutMs);
 			const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 			try {
-				const proc = spawn("bash", ["-lc", rewriteLocalSandboxCommand(params.command, workspace, scratch)], {
-					cwd: workspace,
-					env: {
-						...process.env,
-						HOME: scratch,
-						DCI_WORKSPACE: workspace,
-						DCI_CORPUS: resolve(workspace, "corpus"),
-						DCI_SCRATCH: scratch,
-					},
-					signal: combined,
+				const proc = spawn(sandbox.bwrap, sandboxArgs(sandbox, scratch, params.command), {
+					env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
+					detached: true,
 				});
 				const stdoutChunks: Buffer[] = [];
 				const stderrChunks: Buffer[] = [];
-				proc.stdout.on("data", (chunk) => stdoutChunks.push(Buffer.from(chunk)));
-				proc.stderr.on("data", (chunk) => stderrChunks.push(Buffer.from(chunk)));
-				const exitCode = await new Promise<number>((resolvePromise, reject) => {
-					proc.on("error", reject);
-					proc.on("close", (code) => resolvePromise(code ?? -1));
+				let capturedBytes = 0;
+				let outputLimitExceeded = false;
+				let scratchLimitExceeded = false;
+				let terminationRequested = false;
+				const terminateProcessGroup = () => {
+					if (terminationRequested) return;
+					terminationRequested = true;
+					try {
+						if (proc.pid !== undefined) process.kill(-proc.pid, "SIGKILL");
+						else proc.kill("SIGKILL");
+					} catch {
+						proc.kill("SIGKILL");
+					}
+				};
+				const appendBounded = (chunks: Buffer[], chunk: Buffer): void => {
+					const remaining = DEFAULT_CONTRACT.toolResultMaxChars - capturedBytes;
+					if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+					capturedBytes += chunk.length;
+					if (capturedBytes > DEFAULT_CONTRACT.toolResultMaxChars && !outputLimitExceeded) {
+						outputLimitExceeded = true;
+						terminateProcessGroup();
+					}
+				};
+				proc.stdout.on("data", (chunk) => {
+					appendBounded(stdoutChunks, Buffer.from(chunk));
 				});
+				proc.stderr.on("data", (chunk) => {
+					appendBounded(stderrChunks, Buffer.from(chunk));
+				});
+				let scratchCheck: Promise<void> | undefined;
+				let scratchMonitorError: unknown;
+				const checkScratchLimit = async () => {
+					if ((await directoryUsageBytes(scratch)) > DEFAULT_CONTRACT.maxScratchBytes) {
+						scratchLimitExceeded = true;
+						terminateProcessGroup();
+					}
+				};
+				const scratchMonitor = setInterval(() => {
+					if (scratchCheck) return;
+					scratchCheck = checkScratchLimit()
+						.catch((error: unknown) => {
+							scratchMonitorError = error;
+							terminateProcessGroup();
+						})
+						.finally(() => {
+							scratchCheck = undefined;
+						});
+				}, 100);
+				combined.addEventListener("abort", terminateProcessGroup, { once: true });
+				if (combined.aborted) terminateProcessGroup();
+				let exitCode: number;
+				try {
+					exitCode = await new Promise<number>((resolvePromise, reject) => {
+						proc.on("error", reject);
+						proc.on("close", (code) => resolvePromise(code ?? -1));
+					});
+				} finally {
+					clearInterval(scratchMonitor);
+					combined.removeEventListener("abort", terminateProcessGroup);
+					if (scratchCheck) await scratchCheck;
+				}
+				if (scratchMonitorError) throw scratchMonitorError;
+				await checkScratchLimit();
 				const stdout = Buffer.concat(stdoutChunks).toString("utf8");
 				const stderr = Buffer.concat(stderrChunks).toString("utf8");
-				const text = truncate([stdout, stderr ? `STDERR:\n${stderr}` : "", `exit_code=${exitCode}`].filter(Boolean).join("\n"));
+				const terminationReason = outputLimitExceeded
+					? "[output limit exceeded; process terminated]"
+					: scratchLimitExceeded
+						? "[scratch limit exceeded; process terminated]"
+					: controller.signal.aborted
+						? "[timeout exceeded; process terminated]"
+						: signal?.aborted
+							? "[aborted; process terminated]"
+							: "";
+				const commandOutput = truncate([stdout, stderr ? `STDERR:\n${stderr}` : ""].filter(Boolean).join("\n"));
+				const text = [commandOutput, terminationReason, `exit_code=${exitCode}`].filter(Boolean).join("\n");
 				const bodyEvidence = exitCode === 0 && stdout.trim().length > 0 && commandLooksLikeContentInspection(params.command);
 				if (bodyEvidence) evidence.contentSearchCommands.push(params.command);
 				return { content: [{ type: "text", text }], details: { exitCode, bodyEvidence }, terminate: false };
@@ -559,90 +849,137 @@ not guess from filename lists or return an empty list unless you have exhausted
 reasonable content searches.`;
 }
 
+function redactArgv(argv: string[]): string[] {
+	const secretFlags = new Set(["--openai-api-key", "--api-key", "--token"]);
+	let redactNext = false;
+	return argv.map((arg) => {
+		if (redactNext) {
+			redactNext = false;
+			return "[redacted]";
+		}
+		if (secretFlags.has(arg)) {
+			redactNext = true;
+			return arg;
+		}
+		const matchingFlag = [...secretFlags].find((flag) => arg.startsWith(`${flag}=`));
+		return matchingFlag ? `${matchingFlag}=[redacted]` : arg;
+	});
+}
+
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
-	const workspace = resolve(args.workspace);
-	const scratch = resolve(workspace, "..", "scratch");
+	const sandbox = await validateCorpusSandbox(resolve(args.workspace));
+	await runSandboxPreflight(sandbox);
+	if (args.preflightOnly) {
+		console.log(`bubblewrap corpus sandbox preflight passed: ${sandbox.corpus}`);
+		return;
+	}
+
+	const scratch = await mkdtemp(join(tmpdir(), "dci-bench-sample-"));
 	const output = resolve(args.output);
 	const trace = args.trace ? resolve(args.trace) : undefined;
-	const query = await readFile(resolve(args.queryFile), "utf8");
-	await mkdir(dirname(output), { recursive: true });
-	await mkdir(scratch, { recursive: true });
-	if (trace) await mkdir(dirname(trace), { recursive: true });
+	try {
+		await mkdir(join(scratch, "tmp"), { mode: 0o700 });
+		const query = await readFile(resolve(args.queryFile), "utf8");
+		await mkdir(dirname(output), { recursive: true });
+		if (trace) await mkdir(dirname(trace), { recursive: true });
 
-	let turns = 0;
-	const events: unknown[] = [];
-	const evidence: EvidenceState = { bodyReadFiles: new Set(), contentSearchCommands: [] };
-	const repairReasons: string[] = [];
-	const model = createModel(args.modelProvider, args.model, args.openaiBaseUrl);
-	const streamFn = args.modelProvider === "mock" ? await createMockStreamFn(args.mockScript!) : createBridgeStreamFn(args);
-	const agent = new Agent({
-		streamFn,
-		initialState: {
+		let turns = 0;
+		const events: unknown[] = [];
+		const evidence: EvidenceState = { bodyReadFiles: new Set(), contentSearchCommands: [] };
+		const repairReasons: string[] = [];
+		const model = createModel(args.modelProvider, args.model, args.openaiBaseUrl);
+		const streamFn =
+			args.modelProvider === "mock" ? await createMockStreamFn(args.mockScript!) : createBridgeStreamFn(args);
+		const agent = new Agent({
+			streamFn,
+			initialState: {
 				systemPrompt: DEFAULT_CONTRACT.systemPrompt,
 				model,
 				thinkingLevel: "off",
-				tools: [createReadTool(workspace, evidence), createBashTool(workspace, scratch, evidence)],
+				tools: [createReadTool(sandbox, evidence), createBashTool(sandbox, scratch, evidence)],
 			},
-		toolExecution: "sequential",
-		shouldStopAfterTurn: async ({ context }) => {
-			turns++;
-			const parsed = parseFinalJson(finalAnswerFrom(context.messages));
-			if (parsed && hasBodyEvidence(evidence)) return true;
-			return turns >= args.maxAgentSteps;
-		},
-	});
-	agent.subscribe((event: AgentEvent) => {
-		if (event.type === "turn_end" || event.type === "tool_execution_start" || event.type === "tool_execution_end") {
-			events.push(event);
+			toolExecution: "sequential",
+			shouldStopAfterTurn: async ({ context }) => {
+				turns++;
+				const parsed = parseFinalJson(finalAnswerFrom(context.messages));
+				if (parsed && hasBodyEvidence(evidence)) return true;
+				return turns >= args.maxAgentSteps;
+			},
+		});
+		agent.subscribe((event: AgentEvent) => {
+			if (event.type === "turn_end" || event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+				events.push(event);
+			}
+		});
+		await agent.prompt(buildPrompt(query));
+		let finalText = finalAnswerFrom(agent.state.messages);
+		let parsed = parseFinalJson(finalText);
+		let finalIssue = finalAcceptanceIssue(parsed, evidence);
+		while (finalIssue && turns < args.maxAgentSteps && repairReasons.length < DEFAULT_CONTRACT.maxFinalRepairTurns) {
+			repairReasons.push(finalIssue);
+			await agent.prompt(buildRepairPrompt(finalIssue));
+			finalText = finalAnswerFrom(agent.state.messages);
+			parsed = parseFinalJson(finalText);
+			finalIssue = finalAcceptanceIssue(parsed, evidence);
 		}
-	});
-	await agent.prompt(buildPrompt(query));
-	let finalText = finalAnswerFrom(agent.state.messages);
-	let parsed = parseFinalJson(finalText);
-	let finalIssue = finalAcceptanceIssue(parsed, evidence);
-	while (finalIssue && turns < args.maxAgentSteps && repairReasons.length < DEFAULT_CONTRACT.maxFinalRepairTurns) {
-		repairReasons.push(finalIssue);
-		await agent.prompt(buildRepairPrompt(finalIssue));
-		finalText = finalAnswerFrom(agent.state.messages);
-		parsed = parseFinalJson(finalText);
-		finalIssue = finalAcceptanceIssue(parsed, evidence);
-	}
-	const acceptedParsed = parsed !== undefined && finalIssue === undefined ? parsed : undefined;
-	const toolCalls = agent.state.messages.filter((message) => message.role === "toolResult").length;
-	const result = {
-		valid_output: acceptedParsed !== undefined,
-		failure_reason: acceptedParsed ? null : (finalIssue ?? "max_agent_steps reached before an acceptable final answer"),
-		ranked_doc_ids: acceptedParsed?.ranked_doc_ids ?? [],
-		raw_final_text: finalText,
-		agent_steps: turns,
-		tool_calls: toolCalls,
-		final_output_adapter: acceptedParsed?.adapter ?? null,
-		repair_attempts: repairReasons.length,
-		repair_reasons: repairReasons,
-		body_evidence: {
-			read_files: [...evidence.bodyReadFiles].sort(),
-			content_search_commands: evidence.contentSearchCommands,
-		},
-		model_provider: model.provider,
-		model: model.id,
-		contract: {
-			top_k: DEFAULT_CONTRACT.topK,
-			max_agent_steps: args.maxAgentSteps,
-			tool_allowlist: ["read", "bash"],
-		},
-	};
-	await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8");
-	if (trace) {
-		await writeFile(
-			trace,
-			`${JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), workspace, output, events, messages: agent.state.messages }, null, 2)}\n`,
-			"utf8",
-		);
-	}
-	if (!acceptedParsed) {
-		console.error(`Invalid DCI final answer from ${basename(fileURLToPath(import.meta.url))}: ${finalText}`);
-		process.exitCode = 2;
+		const acceptedParsed = parsed !== undefined && finalIssue === undefined ? parsed : undefined;
+		const toolCalls = agent.state.messages.filter((message) => message.role === "toolResult").length;
+		const result = {
+			valid_output: acceptedParsed !== undefined,
+			failure_reason: acceptedParsed
+				? null
+				: (finalIssue ?? "max_agent_steps reached before an acceptable final answer"),
+			ranked_doc_ids: acceptedParsed?.ranked_doc_ids ?? [],
+			raw_final_text: finalText,
+			agent_steps: turns,
+			tool_calls: toolCalls,
+			final_output_adapter: acceptedParsed?.adapter ?? null,
+			repair_attempts: repairReasons.length,
+			repair_reasons: repairReasons,
+			body_evidence: {
+				read_files: [...evidence.bodyReadFiles].sort(),
+				content_search_commands: evidence.contentSearchCommands,
+			},
+			model_provider: model.provider,
+			model: model.id,
+			inspect_sandbox: "local",
+			tool_sandbox: "bubblewrap",
+			contract: {
+				top_k: DEFAULT_CONTRACT.topK,
+				max_agent_steps: args.maxAgentSteps,
+				tool_allowlist: ["read", "bash"],
+				tool_sandbox: "bubblewrap",
+				max_scratch_bytes: DEFAULT_CONTRACT.maxScratchBytes,
+			},
+		};
+		await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+		if (trace) {
+			await writeFile(
+				trace,
+				`${JSON.stringify(
+					{
+						argv: redactArgv(process.argv.slice(2)),
+						cwd: process.cwd(),
+						workspace: sandbox.workspace,
+						output,
+						inspect_sandbox: "local",
+						tool_sandbox: "bubblewrap",
+						events,
+						messages: agent.state.messages,
+					},
+					null,
+					2,
+				)}\n`,
+				"utf8",
+			);
+		}
+		if (!acceptedParsed) {
+			console.error(`Invalid DCI final answer from ${basename(fileURLToPath(import.meta.url))}: ${finalText}`);
+			process.exitCode = 2;
+		}
+	} finally {
+		await rm(scratch, { recursive: true, force: true });
 	}
 }
 
