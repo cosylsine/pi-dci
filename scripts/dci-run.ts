@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -19,44 +19,42 @@ import {
 	type SimpleStreamOptions,
 	type Tool,
 	type ToolCall,
-	Type,
 } from "@earendil-works/pi-ai";
+import { Unsafe } from "typebox";
 import { Value } from "typebox/value";
+import type { TSchema } from "typebox";
 
-const DEFAULT_CONTRACT = {
-	topK: 10,
-	maxAgentSteps: 1200,
-	maxFinalRepairTurns: 3,
-	sampleTimeoutSeconds: 600,
-	toolResultMaxChars: 20_000,
-	maxScratchBytes: 20_000_000,
-	maxTotalModelTokens: 128_000,
-	maxFinalOutputTokens: 1_024,
-	maxCorpusDocumentBytes: 1_000_000,
-	systemPrompt: `/no_think
-You are the DCI-Bench retrieval agent.
-
-Your task is to search the local corpus for documents relevant to the user's query.
-The corpus is available as markdown files under /workspace/corpus. You may inspect
-files with the provided read and bash tools. Do not use network access, web search,
-external retrievers, embeddings, hidden labels, memory, skills, MCP tools, or
-sub-agents.
-
-You must inspect corpus document content before giving the final answer. A list
-of filenames or file ids is not evidence. Use full-text search commands such as
-rg -n -i or grep -Rin over important query keywords and synonyms, then read the
-most promising document files.
-
-Return only JSON matching this schema:
-{"ranked_doc_ids":["doc_id_1","doc_id_2","doc_id_3"]}
-
-Rules:
-- Return at most 10 document ids.
-- Rank the most relevant document first.
-- Use the original document id, recovered from the corpus filename by removing
-  the .md suffix and URL percent-decoding it when needed.
-- Do not include explanations, markdown fences, scores, or extra keys.`,
+type CanonicalToolDefinition = {
+	name: string;
+	description: string;
+	input_schema: TSchema;
+	result_max_chars: number;
 };
+
+type CanonicalContract = {
+	benchmark_contract_version: string;
+	pi_final_result_version: string;
+	trajectory_schema_version: string;
+	top_k: number;
+	max_agent_steps: number;
+	max_final_repair_turns: number;
+	sample_timeout_seconds: number;
+	tool_result_max_chars: number;
+	max_scratch_bytes: number;
+	max_total_model_tokens: number;
+	max_final_output_tokens: number;
+	max_corpus_document_bytes: number;
+	tool_allowlist: string[];
+	tool_definitions: CanonicalToolDefinition[];
+	failure_kinds: string[];
+	final_answer_schema: Record<string, unknown>;
+	system_prompt: string;
+	query_prompt_template: string;
+	repair_prompt_template: string;
+};
+
+const CONTRACT_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "../../dci_bench/protocol/contract.json");
+const DEFAULT_CONTRACT = JSON.parse(readFileSync(CONTRACT_PATH, "utf8")) as CanonicalContract;
 
 type Args = {
 	preflightOnly: boolean;
@@ -73,18 +71,158 @@ type Args = {
 };
 
 type MockStep =
-	| { type: "tool_call"; name: string; arguments: Record<string, unknown>; id?: string }
-	| { type: "final"; text: string };
+	| { type: "tool_call"; name: string; arguments: Record<string, unknown>; id?: string; usage?: MockUsage }
+	| { type: "final"; text: string; usage?: MockUsage };
 
-function usage(input = 0, output = 0) {
+type MockUsage = {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	cache_read?: number;
+	cache_write?: number;
+	input_tokens?: number;
+	output_tokens?: number;
+	prompt_tokens?: number;
+	completion_tokens?: number;
+};
+
+type UsageSummary = {
+	available: boolean;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cache_read_tokens: number | null;
+	cache_write_tokens: number | null;
+	total_tokens: number | null;
+	total_model_tokens: number | null;
+	turns: number;
+};
+
+type FailureKind = CanonicalContract["failure_kinds"][number];
+
+type StructuredFailure = { kind: Exclude<FailureKind, "none">; message: string } | null;
+
+function sortJsonKeys(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(sortJsonKeys);
+	if (value !== null && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return Object.fromEntries(Object.keys(record).sort().map((key) => [key, sortJsonKeys(record[key])]));
+	}
+	return value;
+}
+
+function prettyJson(value: unknown): string {
+	return `${JSON.stringify(sortJsonKeys(value), null, 2)}\n`;
+}
+
+function makeFailure(kind: Exclude<FailureKind, "none">, message: string): StructuredFailure {
+	if (!DEFAULT_CONTRACT.failure_kinds.includes(kind)) {
+		throw new Error(`Canonical contract does not allow failure kind ${kind}`);
+	}
+	return { kind, message };
+}
+
+function usage(input = 0, output = 0, cacheRead = 0, cacheWrite = 0) {
 	return {
 		input,
 		output,
-		cacheRead: 0,
-		cacheWrite: 0,
+		cacheRead,
+		cacheWrite,
 		totalTokens: input + output,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function parseUsage(raw: unknown): { available: boolean; value: ReturnType<typeof usage> } {
+	if (!raw || typeof raw !== "object") return { available: false, value: usage() };
+	const payload = raw as Record<string, unknown>;
+	const input = numberOrUndefined(payload.input ?? payload.prompt_tokens ?? payload.input_tokens);
+	const output = numberOrUndefined(payload.output ?? payload.completion_tokens ?? payload.output_tokens);
+	const promptDetails = payload.prompt_tokens_details;
+	const promptDetailsCacheRead =
+		promptDetails && typeof promptDetails === "object"
+			? (promptDetails as Record<string, unknown>).cached_tokens
+			: undefined;
+	const cacheRead =
+		numberOrUndefined(
+			payload.cacheRead ??
+				payload.cache_read_tokens ??
+				payload.cache_read ??
+				payload.cache_read_input_tokens ??
+				promptDetailsCacheRead,
+		) ?? 0;
+	const cacheWrite =
+		numberOrUndefined(
+			payload.cacheWrite ?? payload.cache_write_tokens ?? payload.cache_write ?? payload.cache_creation_input_tokens,
+		) ?? 0;
+	if (input === undefined || output === undefined) return { available: false, value: usage() };
+	return { available: true, value: usage(input, output, cacheRead, cacheWrite) };
+}
+
+function unavailableUsage(): ReturnType<typeof usage> & { usageAvailable: boolean } {
+	return { ...usage(), usageAvailable: false };
+}
+
+function availableUsage(value: ReturnType<typeof usage>): ReturnType<typeof usage> & { usageAvailable: boolean } {
+	return { ...value, usageAvailable: true };
+}
+
+function readMessageUsage(message: AssistantMessage): { available: boolean; value: ReturnType<typeof usage> } {
+	const messageWithMarker = message as AssistantMessage & { usageAvailable?: unknown };
+	const usageWithMarker = message.usage as AssistantMessage["usage"] & { usageAvailable?: unknown };
+	if (
+		messageWithMarker.usageAvailable === false ||
+		usageWithMarker.usageAvailable === false ||
+		message.stopReason === "error" ||
+		message.stopReason === "aborted"
+	) {
+		return { available: false, value: usage() };
+	}
+	const parsed = parseUsage(message.usage);
+	return { available: parsed.available, value: parsed.value };
+}
+
+function usageSummary(messages: readonly Message[], totalModelTokens: number): UsageSummary {
+	const assistantMessages = messages.filter((message): message is AssistantMessage => message.role === "assistant");
+	const usages = assistantMessages.map(readMessageUsage);
+	const available = usages.every((item) => item.available);
+	const input = available ? usages.reduce((sum, item) => sum + item.value.input, 0) : null;
+	const output = available ? usages.reduce((sum, item) => sum + item.value.output, 0) : null;
+	const cacheRead = available ? usages.reduce((sum, item) => sum + item.value.cacheRead, 0) : null;
+	const cacheWrite = available ? usages.reduce((sum, item) => sum + item.value.cacheWrite, 0) : null;
+	const total = available ? usages.reduce((sum, item) => sum + item.value.totalTokens, 0) : null;
+	return {
+		available,
+		input_tokens: input,
+		output_tokens: output,
+		cache_read_tokens: cacheRead,
+		cache_write_tokens: cacheWrite,
+		total_tokens: total,
+		total_model_tokens: available ? totalModelTokens : null,
+		turns: assistantMessages.length,
+	};
+}
+
+function usageByTurn(messages: readonly Message[]): Array<Record<string, number | boolean | null>> {
+	let turn = 0;
+	return messages.flatMap((message) => {
+		if (message.role !== "assistant") return [];
+		turn++;
+		const current = readMessageUsage(message);
+		return [
+			{
+				turn,
+				available: current.available,
+				input_tokens: current.available ? current.value.input : null,
+				output_tokens: current.available ? current.value.output : null,
+				total_tokens: current.available ? current.value.totalTokens : null,
+			},
+		];
+	});
 }
 
 function textOf(content: Message["content"] | AssistantMessage["content"]): string {
@@ -138,30 +276,27 @@ function parseArgs(argv: string[]): Args {
 		openaiBaseUrl: String(values.get("openai-base-url") ?? process.env.OPENAI_BASE_URL ?? "http://localhost:13131/v1"),
 		openaiApiKey: String(values.get("openai-api-key") ?? process.env.OPENAI_API_KEY ?? "inspect"),
 		model: String(values.get("model") ?? "inspect"),
-		maxAgentSteps: positiveInt("max-agent-steps", DEFAULT_CONTRACT.maxAgentSteps),
+		maxAgentSteps: positiveInt("max-agent-steps", DEFAULT_CONTRACT.max_agent_steps),
 	};
 }
 
-const readSchema = Type.Object(
-	{
-		path: Type.String({ description: "Path to read. Absolute paths and paths relative to workspace are accepted." }),
-		offset: Type.Optional(Type.Number({ description: "Zero-based character offset." })),
-		limit: Type.Optional(Type.Number({ description: "Maximum characters to return." })),
-	},
-	{ additionalProperties: false },
-);
+function toolDefinition(name: string): CanonicalToolDefinition {
+	const definition = DEFAULT_CONTRACT.tool_definitions.find((item) => item.name === name);
+	if (!definition) throw new Error(`Canonical contract is missing the ${name} tool definition`);
+	return definition;
+}
 
-const bashSchema = Type.Object(
-	{
-		command: Type.String({ description: "Shell command to run in the workspace." }),
-		timeout_seconds: Type.Optional(Type.Number({ description: "Timeout in seconds, max 60." })),
-	},
-	{ additionalProperties: false },
-);
+type ReadToolArguments = { path: string; offset?: number; limit?: number };
+type BashToolArguments = { command: string; timeout_seconds?: number };
+
+const readDefinition = toolDefinition("read");
+const bashDefinition = toolDefinition("bash");
+const readSchema = Unsafe<ReadToolArguments>(readDefinition.input_schema);
+const bashSchema = Unsafe<BashToolArguments>(bashDefinition.input_schema);
 
 function truncate(text: string): string {
-	if (text.length <= DEFAULT_CONTRACT.toolResultMaxChars) return text;
-	return `${text.slice(0, DEFAULT_CONTRACT.toolResultMaxChars)}\n[truncated]`;
+	if (text.length <= DEFAULT_CONTRACT.tool_result_max_chars) return text;
+	return `${text.slice(0, DEFAULT_CONTRACT.tool_result_max_chars)}\n[truncated]`;
 }
 
 async function directoryUsageBytes(root: string): Promise<number> {
@@ -189,7 +324,7 @@ async function directoryUsageBytes(root: string): Promise<number> {
 				throw error;
 			}
 			total += Math.max(info.size, info.blocks * 512);
-			if (total > DEFAULT_CONTRACT.maxScratchBytes) return total;
+			if (total > DEFAULT_CONTRACT.max_scratch_bytes) return total;
 			if (info.isDirectory() && !info.isSymbolicLink()) pending.push(path);
 		}
 	}
@@ -245,7 +380,7 @@ async function validateCorpusSandbox(workspace: string): Promise<CorpusSandbox> 
 		if (entryInfo.nlink !== 1) {
 			throw new Error(`Corpus entries must not be hard links, found: ${entry.name}`);
 		}
-		if (entryInfo.size > DEFAULT_CONTRACT.maxCorpusDocumentBytes) {
+		if (entryInfo.size > DEFAULT_CONTRACT.max_corpus_document_bytes) {
 			throw new Error(`Corpus document exceeds the size limit: ${entry.name}`);
 		}
 	}
@@ -445,7 +580,7 @@ function createReadTool(sandbox: CorpusSandbox, evidence: EvidenceState): AgentT
 	return {
 		name: "read",
 		label: "read",
-		description: "Read UTF-8 text from a file in the mounted workspace.",
+		description: readDefinition.description,
 		parameters: readSchema,
 		executionMode: "sequential",
 		prepareArguments: (args) => Value.Parse(readSchema, args),
@@ -462,12 +597,12 @@ function createReadTool(sandbox: CorpusSandbox, evidence: EvidenceState): AgentT
 			}
 			if (!info.isFile()) throw new Error(`Corpus read requires a regular file: ${params.path}`);
 			if (info.nlink !== 1) throw new Error(`Corpus read rejects hard-linked files: ${params.path}`);
-			if (info.size > DEFAULT_CONTRACT.maxCorpusDocumentBytes) {
+			if (info.size > DEFAULT_CONTRACT.max_corpus_document_bytes) {
 				throw new Error(`Corpus document exceeds the size limit: ${params.path}`);
 			}
 			const raw = await readFile(path, "utf8");
 			const offset = Math.max(0, Math.floor(params.offset ?? 0));
-			const limit = Math.max(1, Math.floor(params.limit ?? DEFAULT_CONTRACT.toolResultMaxChars));
+			const limit = Math.max(1, Math.floor(params.limit ?? DEFAULT_CONTRACT.tool_result_max_chars));
 			const text = truncate(raw.slice(offset, offset + limit));
 			const relativePath = workspaceRelativePath(sandbox.workspace, path);
 			evidence.bodyReadFiles.add(relativePath);
@@ -483,7 +618,7 @@ function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence: Evide
 	return {
 		name: "bash",
 		label: "bash",
-		description: "Run a local shell command in the workspace without network access.",
+		description: bashDefinition.description,
 		parameters: bashSchema,
 		executionMode: "sequential",
 		prepareArguments: (args) => Value.Parse(bashSchema, args),
@@ -514,10 +649,10 @@ function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence: Evide
 					}
 				};
 				const appendBounded = (chunks: Buffer[], chunk: Buffer): void => {
-					const remaining = DEFAULT_CONTRACT.toolResultMaxChars - capturedBytes;
+					const remaining = DEFAULT_CONTRACT.tool_result_max_chars - capturedBytes;
 					if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
 					capturedBytes += chunk.length;
-					if (capturedBytes > DEFAULT_CONTRACT.toolResultMaxChars && !outputLimitExceeded) {
+					if (capturedBytes > DEFAULT_CONTRACT.tool_result_max_chars && !outputLimitExceeded) {
 						outputLimitExceeded = true;
 						terminateProcessGroup();
 					}
@@ -531,7 +666,7 @@ function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence: Evide
 				let scratchCheck: Promise<void> | undefined;
 				let scratchMonitorError: unknown;
 				const checkScratchLimit = async () => {
-					if ((await directoryUsageBytes(scratch)) > DEFAULT_CONTRACT.maxScratchBytes) {
+					if ((await directoryUsageBytes(scratch)) > DEFAULT_CONTRACT.max_scratch_bytes) {
 						scratchLimitExceeded = true;
 						terminateProcessGroup();
 					}
@@ -610,7 +745,7 @@ function parseRankedIds(value: unknown): string[] | undefined {
 	if (
 		Array.isArray(value) &&
 		value.length > 0 &&
-		value.length <= DEFAULT_CONTRACT.topK &&
+		value.length <= DEFAULT_CONTRACT.top_k &&
 		value.every((item: unknown) => typeof item === "string" && item.length > 0)
 	) {
 		const ranked = value.map(normalizeDocId);
@@ -664,8 +799,8 @@ function createModel(provider: Args["modelProvider"], id: string, baseUrl: strin
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: DEFAULT_CONTRACT.maxTotalModelTokens,
-		maxTokens: DEFAULT_CONTRACT.maxFinalOutputTokens,
+		contextWindow: DEFAULT_CONTRACT.max_total_model_tokens,
+		maxTokens: DEFAULT_CONTRACT.max_final_output_tokens,
 	};
 }
 
@@ -689,6 +824,8 @@ async function createMockStreamFn(mockScript: string): Promise<StreamFn> {
 			message.provider = model.provider;
 			message.model = model.id;
 			message.api = model.api;
+			const stepUsage = parseUsage(step.usage);
+			message.usage = stepUsage.available ? availableUsage(stepUsage.value) : unavailableUsage();
 			stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
 			stream.end(message);
 		});
@@ -749,7 +886,7 @@ function createBridgeStreamFn(args: Args): StreamFn {
 				messages: toOpenAIMessages(context),
 				tools: toOpenAITools(context.tools),
 				tool_choice: options?.toolChoice ?? "auto",
-				max_tokens: DEFAULT_CONTRACT.maxFinalOutputTokens,
+				max_tokens: DEFAULT_CONTRACT.max_final_output_tokens,
 				temperature: 0,
 			};
 			try {
@@ -789,13 +926,14 @@ function createBridgeStreamFn(args: Args): StreamFn {
 					content.splice(0, content.length, pseudoToolCall);
 				}
 				const stopReason = content.some((part) => part.type === "toolCall") ? "toolUse" : "stop";
+				const responseUsage = parseUsage(payload.usage);
 				const message: AssistantMessage = {
 					role: "assistant",
 					content,
 					api: model.api,
 					provider: model.provider,
 					model: model.id,
-					usage: usage(payload.usage?.prompt_tokens ?? 0, payload.usage?.completion_tokens ?? 0),
+					usage: responseUsage.available ? availableUsage(responseUsage.value) : unavailableUsage(),
 					stopReason,
 					rawStopReason: choice?.finish_reason,
 					timestamp: Date.now(),
@@ -809,7 +947,7 @@ function createBridgeStreamFn(args: Args): StreamFn {
 					api: model.api,
 					provider: model.provider,
 					model: model.id,
-					usage: usage(),
+					usage: unavailableUsage(),
 					stopReason: "error",
 					errorMessage: error instanceof Error ? error.message : String(error),
 					timestamp: Date.now(),
@@ -823,30 +961,11 @@ function createBridgeStreamFn(args: Args): StreamFn {
 }
 
 function buildPrompt(query: string): string {
-	return `/no_think
-Query:
-${query}
-
-Use bash or read to inspect /workspace/corpus before answering. You must inspect
-document content before giving the final answer; a filename listing alone is not
-evidence. Prefer full-text searches such as rg -n -i over query keywords and
-synonyms, then read promising corpus files to verify relevance. Do not infer
-document ids from ls/find ordering.
-
-Return the top relevant document ids as JSON only, with exactly this key:
-ranked_doc_ids. Do not use top_documents, doc_ids, scores, explanations, or .md
-filename suffixes.`;
+	return DEFAULT_CONTRACT.query_prompt_template.replace("{query}", query);
 }
 
 function buildRepairPrompt(reason: string): string {
-	return `/no_think
-The previous answer cannot be accepted: ${reason}.
-
-Continue the same retrieval task. Use full-text inspection of /workspace/corpus
-now: run rg/grep over important query keywords and synonyms, read the most
-promising document files, then return only valid JSON with ranked_doc_ids. Do
-not guess from filename lists or return an empty list unless you have exhausted
-reasonable content searches.`;
+	return DEFAULT_CONTRACT.repair_prompt_template.replace("{reason}", reason);
 }
 
 function redactArgv(argv: string[]): string[] {
@@ -885,6 +1004,8 @@ async function main() {
 		if (trace) await mkdir(dirname(trace), { recursive: true });
 
 		let turns = 0;
+		let totalModelTokens = 0;
+		let structuredFailure: StructuredFailure = null;
 		const events: unknown[] = [];
 		const evidence: EvidenceState = { bodyReadFiles: new Set(), contentSearchCommands: [] };
 		const repairReasons: string[] = [];
@@ -894,42 +1015,106 @@ async function main() {
 		const agent = new Agent({
 			streamFn,
 			initialState: {
-				systemPrompt: DEFAULT_CONTRACT.systemPrompt,
+				systemPrompt: DEFAULT_CONTRACT.system_prompt,
 				model,
 				thinkingLevel: "off",
 				tools: [createReadTool(sandbox, evidence), createBashTool(sandbox, scratch, evidence)],
 			},
 			toolExecution: "sequential",
-			shouldStopAfterTurn: async ({ context }) => {
+			shouldStopAfterTurn: async ({ message, context }) => {
 				turns++;
+				const currentUsage = readMessageUsage(message);
+				if (!currentUsage.available) {
+					structuredFailure = makeFailure(
+						"usage_unavailable",
+						`model usage was missing or incomplete on assistant turn ${turns}`,
+					);
+					return true;
+				}
+				totalModelTokens += currentUsage.value.input + currentUsage.value.output;
+				if (totalModelTokens >= DEFAULT_CONTRACT.max_total_model_tokens) {
+					structuredFailure = makeFailure(
+						"token_limit",
+						`cumulative model input/output tokens reached ${DEFAULT_CONTRACT.max_total_model_tokens}`,
+					);
+					return true;
+				}
 				const parsed = parseFinalJson(finalAnswerFrom(context.messages));
 				if (parsed && hasBodyEvidence(evidence)) return true;
-				return turns >= args.maxAgentSteps;
+				if (turns >= args.maxAgentSteps) {
+					structuredFailure = makeFailure(
+						"max_agent_steps",
+						"max_agent_steps reached before an acceptable final answer",
+					);
+					return true;
+				}
+				return false;
 			},
 		});
+		const startedAt = new Date().toISOString();
 		agent.subscribe((event: AgentEvent) => {
 			if (event.type === "turn_end" || event.type === "tool_execution_start" || event.type === "tool_execution_end") {
 				events.push(event);
 			}
 		});
 		await agent.prompt(buildPrompt(query));
+		const assistantMessages = agent.state.messages.filter(
+			(message): message is AssistantMessage => message.role === "assistant",
+		);
+		const unavailableUsageMessage = assistantMessages.find((message) => !readMessageUsage(message).available);
+		if (!structuredFailure && unavailableUsageMessage?.stopReason === "error") {
+			structuredFailure = makeFailure("agent_error", unavailableUsageMessage.errorMessage ?? "agent returned an error");
+		}
+		if (!structuredFailure && unavailableUsageMessage) {
+			structuredFailure = makeFailure("usage_unavailable", "model usage was missing or incomplete");
+		}
 		let finalText = finalAnswerFrom(agent.state.messages);
 		let parsed = parseFinalJson(finalText);
 		let finalIssue = finalAcceptanceIssue(parsed, evidence);
-		while (finalIssue && turns < args.maxAgentSteps && repairReasons.length < DEFAULT_CONTRACT.maxFinalRepairTurns) {
+		while (
+			!structuredFailure &&
+			finalIssue &&
+			turns < args.maxAgentSteps &&
+			repairReasons.length < DEFAULT_CONTRACT.max_final_repair_turns
+		) {
 			repairReasons.push(finalIssue);
 			await agent.prompt(buildRepairPrompt(finalIssue));
+			const repairAssistantMessages = agent.state.messages.filter(
+				(message): message is AssistantMessage => message.role === "assistant",
+			);
+			const repairUnavailableUsageMessage = repairAssistantMessages.find((message) => !readMessageUsage(message).available);
+			if (!structuredFailure && repairUnavailableUsageMessage?.stopReason === "error") {
+				structuredFailure = makeFailure(
+					"agent_error",
+					repairUnavailableUsageMessage.errorMessage ?? "agent returned an error",
+				);
+			}
+			if (!structuredFailure && repairUnavailableUsageMessage) {
+				structuredFailure = makeFailure("usage_unavailable", "model usage was missing or incomplete");
+			}
 			finalText = finalAnswerFrom(agent.state.messages);
 			parsed = parseFinalJson(finalText);
 			finalIssue = finalAcceptanceIssue(parsed, evidence);
 		}
-		const acceptedParsed = parsed !== undefined && finalIssue === undefined ? parsed : undefined;
+		const acceptedParsed = !structuredFailure && parsed !== undefined && finalIssue === undefined ? parsed : undefined;
 		const toolCalls = agent.state.messages.filter((message) => message.role === "toolResult").length;
-		const result = {
-			valid_output: acceptedParsed !== undefined,
-			failure_reason: acceptedParsed
+		const failure = structuredFailure ??
+			(acceptedParsed
 				? null
-				: (finalIssue ?? "max_agent_steps reached before an acceptable final answer"),
+				: makeFailure("invalid_json", finalIssue ?? "final answer did not match the DCI ranked_doc_ids JSON schema"));
+		const messageSnapshot = agent.state.messages.filter(
+			(message): message is Message => message.role === "assistant" || message.role === "user" || message.role === "toolResult",
+		);
+		const usage = usageSummary(messageSnapshot, totalModelTokens);
+		const completedAt = new Date().toISOString();
+		const result = {
+			pi_result_version: DEFAULT_CONTRACT.pi_final_result_version,
+			contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
+			started_at: startedAt,
+			completed_at: completedAt,
+			valid_output: acceptedParsed !== undefined,
+			failure_reason: failure?.message ?? null,
+			failure,
 			ranked_doc_ids: acceptedParsed?.ranked_doc_ids ?? [],
 			raw_final_text: finalText,
 			agent_steps: turns,
@@ -937,6 +1122,8 @@ async function main() {
 			final_output_adapter: acceptedParsed?.adapter ?? null,
 			repair_attempts: repairReasons.length,
 			repair_reasons: repairReasons,
+			usage_summary: usage,
+			usage,
 			body_evidence: {
 				read_files: [...evidence.bodyReadFiles].sort(),
 				content_search_commands: evidence.contentSearchCommands,
@@ -946,31 +1133,41 @@ async function main() {
 			inspect_sandbox: "local",
 			tool_sandbox: "bubblewrap",
 			contract: {
-				top_k: DEFAULT_CONTRACT.topK,
+				benchmark_contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
+				top_k: DEFAULT_CONTRACT.top_k,
 				max_agent_steps: args.maxAgentSteps,
-				tool_allowlist: ["read", "bash"],
+				max_total_model_tokens: DEFAULT_CONTRACT.max_total_model_tokens,
+				max_final_output_tokens: DEFAULT_CONTRACT.max_final_output_tokens,
+				max_final_repair_turns: DEFAULT_CONTRACT.max_final_repair_turns,
+				sample_timeout_seconds: DEFAULT_CONTRACT.sample_timeout_seconds,
+				tool_result_max_chars: DEFAULT_CONTRACT.tool_result_max_chars,
+				tool_allowlist: DEFAULT_CONTRACT.tool_allowlist,
 				tool_sandbox: "bubblewrap",
-				max_scratch_bytes: DEFAULT_CONTRACT.maxScratchBytes,
+				max_scratch_bytes: DEFAULT_CONTRACT.max_scratch_bytes,
 			},
 		};
-		await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+		await writeFile(output, prettyJson(result), "utf8");
 		if (trace) {
 			await writeFile(
 				trace,
-				`${JSON.stringify(
-					{
+				prettyJson({
+						schema_version: DEFAULT_CONTRACT.trajectory_schema_version,
 						argv: redactArgv(process.argv.slice(2)),
 						cwd: process.cwd(),
 						workspace: sandbox.workspace,
 						output,
 						inspect_sandbox: "local",
 						tool_sandbox: "bubblewrap",
+						contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
+						started_at: startedAt,
+						completed_at: completedAt,
+						failure,
+						usage_summary: usage,
+						usage,
+						usage_by_turn: usageByTurn(messageSnapshot),
 						events,
 						messages: agent.state.messages,
-					},
-					null,
-					2,
-				)}\n`,
+					}),
 				"utf8",
 			);
 		}
