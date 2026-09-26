@@ -50,6 +50,7 @@ type CanonicalContract = {
 	final_answer_schema: Record<string, unknown>;
 	system_prompt: string;
 	query_prompt_template: string;
+	task_instruction_template: string;
 	repair_prompt_template: string;
 };
 
@@ -59,6 +60,7 @@ const DEFAULT_CONTRACT = JSON.parse(readFileSync(CONTRACT_PATH, "utf8")) as Cano
 type Args = {
 	preflightOnly: boolean;
 	queryFile: string;
+	taskInstructionFile?: string;
 	workspace: string;
 	output: string;
 	trace?: string;
@@ -68,6 +70,7 @@ type Args = {
 	openaiApiKey: string;
 	model: string;
 	maxAgentSteps: number;
+	contextWindow: number;
 };
 
 type MockStep =
@@ -268,6 +271,8 @@ function parseArgs(argv: string[]): Args {
 	return {
 		preflightOnly,
 		queryFile: preflightOnly ? "" : required("query-file"),
+		taskInstructionFile:
+			typeof values.get("task-instruction-file") === "string" ? String(values.get("task-instruction-file")) : undefined,
 		workspace: required("workspace"),
 		output: preflightOnly ? "" : required("output"),
 		trace: typeof values.get("trace") === "string" ? String(values.get("trace")) : undefined,
@@ -277,6 +282,7 @@ function parseArgs(argv: string[]): Args {
 		openaiApiKey: String(values.get("openai-api-key") ?? process.env.OPENAI_API_KEY ?? "inspect"),
 		model: String(values.get("model") ?? "inspect"),
 		maxAgentSteps: positiveInt("max-agent-steps", DEFAULT_CONTRACT.max_agent_steps),
+		contextWindow: positiveInt("context-window", DEFAULT_CONTRACT.max_total_model_tokens),
 	};
 }
 
@@ -789,7 +795,7 @@ function finalAcceptanceIssue(parsed: ParsedFinal | undefined, evidence: Evidenc
 	return undefined;
 }
 
-function createModel(provider: Args["modelProvider"], id: string, baseUrl: string): Model<Api> {
+function createModel(provider: Args["modelProvider"], id: string, baseUrl: string, contextWindow: number): Model<Api> {
 	return {
 		id,
 		name: id,
@@ -799,9 +805,43 @@ function createModel(provider: Args["modelProvider"], id: string, baseUrl: strin
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: DEFAULT_CONTRACT.max_total_model_tokens,
+		contextWindow,
 		maxTokens: DEFAULT_CONTRACT.max_final_output_tokens,
 	};
+}
+
+const CONTEXT_SAFETY_TOKENS = 4096;
+
+function estimateNextInputTokens(context: Context): number {
+	let lastUsageIndex = -1;
+	let estimated = 0;
+	for (let index = context.messages.length - 1; index >= 0; index--) {
+		const message = context.messages[index];
+		if (message.role !== "assistant") continue;
+		const current = readMessageUsage(message);
+		if (!current.available) continue;
+		lastUsageIndex = index;
+		estimated = current.value.input + current.value.output;
+		break;
+	}
+	const trailingMessages = context.messages.slice(lastUsageIndex + 1);
+	const trailingChars = trailingMessages.reduce((total, message) => total + textOf(message.content).length, 0);
+	if (lastUsageIndex < 0) {
+		estimated += Math.ceil((context.systemPrompt?.length ?? 0) / 4);
+		estimated += Math.ceil(JSON.stringify(context.tools ?? []).length / 4);
+	}
+	return estimated + Math.ceil(trailingChars / 4);
+}
+
+function failureFromAgentError(message: string): StructuredFailure {
+	const lowered = message.toLowerCase();
+	if (
+		(lowered.includes("context") && (lowered.includes("length") || lowered.includes("overflow"))) ||
+		lowered.includes("dci_context_window_preflight")
+	) {
+		return makeFailure("context_overflow", message);
+	}
+	return makeFailure("agent_error", message);
 }
 
 async function createMockStreamFn(mockScript: string): Promise<StreamFn> {
@@ -880,16 +920,27 @@ function createBridgeStreamFn(args: Args): StreamFn {
 	return async (model, context, options?: SimpleStreamOptions) => {
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(async () => {
-			const baseUrl = args.openaiBaseUrl.replace(/\/+$/, "");
-			const request = {
-				model: args.model,
-				messages: toOpenAIMessages(context),
-				tools: toOpenAITools(context.tools),
-				tool_choice: options?.toolChoice ?? "auto",
-				max_tokens: DEFAULT_CONTRACT.max_final_output_tokens,
-				temperature: 0,
-			};
 			try {
+				const baseUrl = args.openaiBaseUrl.replace(/\/+$/, "");
+				const estimatedInputTokens = estimateNextInputTokens(context);
+				if (
+					estimatedInputTokens + DEFAULT_CONTRACT.max_final_output_tokens + CONTEXT_SAFETY_TOKENS >
+					model.contextWindow
+				) {
+					throw new Error(
+						`DCI_CONTEXT_WINDOW_PREFLIGHT: estimated input ${estimatedInputTokens} plus ` +
+							`${DEFAULT_CONTRACT.max_final_output_tokens} output and ${CONTEXT_SAFETY_TOKENS} safety tokens ` +
+							`exceeds model context window ${model.contextWindow}`,
+					);
+				}
+				const request = {
+					model: args.model,
+					messages: toOpenAIMessages(context),
+					tools: toOpenAITools(context.tools),
+					tool_choice: options?.toolChoice ?? "auto",
+					max_tokens: DEFAULT_CONTRACT.max_final_output_tokens,
+					temperature: 0,
+				};
 				const response = await fetch(`${baseUrl}/chat/completions`, {
 					method: "POST",
 					headers: {
@@ -960,8 +1011,14 @@ function createBridgeStreamFn(args: Args): StreamFn {
 	};
 }
 
-function buildPrompt(query: string): string {
-	return DEFAULT_CONTRACT.query_prompt_template.replace("{query}", query);
+function buildPrompt(query: string, taskInstruction: string): string {
+	const instruction = taskInstruction.trim();
+	const instructionBlock = instruction
+		? DEFAULT_CONTRACT.task_instruction_template.replace("{task_instruction}", instruction)
+		: "";
+	return DEFAULT_CONTRACT.query_prompt_template
+		.replace("{query}", query)
+		.replace("{task_instruction_block}", instructionBlock);
 }
 
 function buildRepairPrompt(reason: string): string {
@@ -1000,6 +1057,9 @@ async function main() {
 	try {
 		await mkdir(join(scratch, "tmp"), { mode: 0o700 });
 		const query = await readFile(resolve(args.queryFile), "utf8");
+		const taskInstruction = args.taskInstructionFile
+			? (await readFile(resolve(args.taskInstructionFile), "utf8")).trim()
+			: "";
 		await mkdir(dirname(output), { recursive: true });
 		if (trace) await mkdir(dirname(trace), { recursive: true });
 
@@ -1009,7 +1069,7 @@ async function main() {
 		const events: unknown[] = [];
 		const evidence: EvidenceState = { bodyReadFiles: new Set(), contentSearchCommands: [] };
 		const repairReasons: string[] = [];
-		const model = createModel(args.modelProvider, args.model, args.openaiBaseUrl);
+		const model = createModel(args.modelProvider, args.model, args.openaiBaseUrl, args.contextWindow);
 		const streamFn =
 			args.modelProvider === "mock" ? await createMockStreamFn(args.mockScript!) : createBridgeStreamFn(args);
 		const agent = new Agent({
@@ -1057,13 +1117,13 @@ async function main() {
 				events.push(event);
 			}
 		});
-		await agent.prompt(buildPrompt(query));
+		await agent.prompt(buildPrompt(query, taskInstruction));
 		const assistantMessages = agent.state.messages.filter(
 			(message): message is AssistantMessage => message.role === "assistant",
 		);
 		const unavailableUsageMessage = assistantMessages.find((message) => !readMessageUsage(message).available);
 		if (!structuredFailure && unavailableUsageMessage?.stopReason === "error") {
-			structuredFailure = makeFailure("agent_error", unavailableUsageMessage.errorMessage ?? "agent returned an error");
+			structuredFailure = failureFromAgentError(unavailableUsageMessage.errorMessage ?? "agent returned an error");
 		}
 		if (!structuredFailure && unavailableUsageMessage) {
 			structuredFailure = makeFailure("usage_unavailable", "model usage was missing or incomplete");
@@ -1084,8 +1144,7 @@ async function main() {
 			);
 			const repairUnavailableUsageMessage = repairAssistantMessages.find((message) => !readMessageUsage(message).available);
 			if (!structuredFailure && repairUnavailableUsageMessage?.stopReason === "error") {
-				structuredFailure = makeFailure(
-					"agent_error",
+				structuredFailure = failureFromAgentError(
 					repairUnavailableUsageMessage.errorMessage ?? "agent returned an error",
 				);
 			}
@@ -1134,8 +1193,10 @@ async function main() {
 			tool_sandbox: "bubblewrap",
 			contract: {
 				benchmark_contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
+				task_instruction: taskInstruction,
 				top_k: DEFAULT_CONTRACT.top_k,
 				max_agent_steps: args.maxAgentSteps,
+				context_window: args.contextWindow,
 				max_total_model_tokens: DEFAULT_CONTRACT.max_total_model_tokens,
 				max_final_output_tokens: DEFAULT_CONTRACT.max_final_output_tokens,
 				max_final_repair_turns: DEFAULT_CONTRACT.max_final_repair_turns,
@@ -1159,6 +1220,7 @@ async function main() {
 						inspect_sandbox: "local",
 						tool_sandbox: "bubblewrap",
 						contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
+						task_instruction: taskInstruction,
 						started_at: startedAt,
 						completed_at: completedAt,
 						failure,
