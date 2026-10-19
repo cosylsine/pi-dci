@@ -1,0 +1,5 @@
+{
+	"extends": "./tsconfig.json",
+	"include": ["scripts/dci-run.ts", "scripts/dci-run.test.ts", "scripts/dci-code-run.test.ts"],
+	"exclude": []
+}
