@@ -1,12 +1,74 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { fauxAssistantMessage, type Context, type Model } from "@earendil-works/pi-ai";
 import { corpusDocumentIds, createBridgeStreamFn, createReadTool, documentIdIssue, estimateBudgetReserve, parseFinalJson, truncate, utf8Prefix } from "./dci-run.ts";
+
+const PI_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const DCI_RUN = join(dirname(fileURLToPath(import.meta.url)), "dci-run.ts");
+
+type MockUsage = { input?: number; output?: number };
+type MockStep =
+	| { type: "tool_call"; name: string; arguments: Record<string, unknown>; id?: string; usage?: MockUsage }
+	| { type: "tool_calls"; calls: Array<{ name: string; arguments: Record<string, unknown>; id?: string }>; usage?: MockUsage }
+	| { type: "final"; text: string; usage?: MockUsage };
+
+type TraceEvent = { type?: string; toolName?: string; isError?: boolean };
+type StageTiming = {
+	sandbox_validate_seconds?: unknown;
+	sandbox_preflight_seconds?: unknown;
+	bash_wall_seconds?: unknown;
+	bash_calls?: unknown;
+};
+type RunnerResult = Record<string, unknown> & {
+	failure?: { kind?: string } | null;
+	stage_timing?: StageTiming;
+	trace?: { events?: TraceEvent[]; stage_timing?: StageTiming };
+};
+
+async function runV2Mock(steps: MockStep[], tokenBudget?: string): Promise<RunnerResult> {
+	const root = await mkdtemp(join(tmpdir(), "dci-v2-transcript-"));
+	try {
+		const workspace = join(root, "workspace");
+		await mkdir(join(workspace, "corpus"), { recursive: true });
+		await writeFile(join(workspace, "corpus", "doc.md"), "Relevant document body\n", "utf8");
+		const query = join(root, "query.txt");
+		const mock = join(root, "mock.json");
+		const output = join(root, "result.json");
+		const trace = join(root, "trace.json");
+		await writeFile(query, "Find the relevant document", "utf8");
+		await writeFile(mock, JSON.stringify(steps), "utf8");
+		const environment: NodeJS.ProcessEnv = { ...process.env, DCI_PROTOCOL_PROFILE: "document-pool-v2-lite" };
+		delete environment.DCI_PROTOCOL_CONTRACT_SHA256;
+		if (tokenBudget === undefined) delete environment.DCI_DOCUMENT_TOKEN_BUDGET;
+		else environment.DCI_DOCUMENT_TOKEN_BUDGET = tokenBudget;
+		const child = spawn(process.execPath, ["--import", "tsx", DCI_RUN,
+			"--query-file", query, "--workspace", workspace, "--output", output,
+			"--trace", trace, "--mock-script", mock, "--model", "mock", "--timeout-seconds", "30"],
+			{ cwd: PI_ROOT, env: environment, stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+		const code = await new Promise<number>((resolve, reject) => {
+			child.on("error", reject);
+			child.on("close", (status) => resolve(status ?? -1));
+		});
+		const result = JSON.parse(await readFile(output, "utf8")) as RunnerResult;
+		result.trace = JSON.parse(await readFile(trace, "utf8")) as RunnerResult["trace"];
+		assert.ok(code === 0 || code === 2, `unexpected runner exit ${code}: ${stderr || stdout}`);
+		return result;
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+}
 
 test("calibrated reserve uses observed usage and UTF-8 growth while preserving the v5 baseline", () => {
 	const assistant = fauxAssistantMessage("tool call");
@@ -165,4 +227,141 @@ test("bridge sends canonical generation parameters, preserves length stop, and c
 		server.closeAllConnections();
 		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 	}
+});
+
+test("v2 dynamic reserve funds only final and one repair from current history", () => {
+	const assistant = fauxAssistantMessage("read");
+	assistant.usage = { ...assistant.usage, input: 5000, output: 100, totalTokens: 5100 };
+	const context: Context = { messages: [
+		assistant,
+		{ role: "toolResult", toolCallId: "read", toolName: "read", content: [{ type: "text", text: "正文😀" }], isError: false, timestamp: 0 },
+	] };
+	const reserve = estimateBudgetReserve(context, { reserve_tokens: 0, dynamic_reserve: true });
+	assert.ok(reserve.reserve > 0);
+	assert.ok(reserve.reserve < 58432);
+	assert.ok(reserve.reserve < 64000);
+});
+
+test("v2 stops after twelve search assistant turns and preserves a final turn", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const steps: MockStep[] = [];
+	for (let offset = 0; offset < 12; offset++) {
+		steps.push({ type: "tool_call", name: "read", arguments: { path: "doc.md", offset, limit: 4 }, usage: { input: 10, output: 1 } });
+	}
+	steps.push({ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } });
+	const result = await runV2Mock(steps);
+	assert.equal(result.valid_output, true);
+	assert.equal(result.search_turns, 12);
+	assert.equal(result.tool_invocations, 12);
+	assert.equal(result.agent_steps, 13);
+	assert.equal(result.repair_attempts, 0);
+});
+
+test("v2 caps parallel tool arrays before executing an extra call", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const calls = Array.from({ length: 25 }, (_, index) => ({
+		name: "bash", id: `bash-${index}`, arguments: { command: "true" },
+	}));
+	const result = await runV2Mock([
+		{ type: "tool_calls", calls, usage: { input: 10, output: 1 } },
+	]);
+	assert.equal(result.valid_output, false);
+	assert.equal(result.failure?.kind, "tool_failure");
+	assert.equal(result.tool_invocations, 24);
+	assert.equal(result.tool_calls, 24);
+	assert.equal(result.search_turns, 1);
+	const executedBash = result.trace?.events?.filter((event) =>
+		event.type === "tool_execution_end" && event.toolName === "bash" && event.isError === false).length ?? 0;
+	assert.equal(executedBash, 24);
+});
+
+test("v2 reports monotonic sandbox and bash stage timing", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "bash", arguments: { command: "true" }, usage: { input: 10, output: 1 } },
+		{ type: "tool_call", name: "bash", arguments: { command: "true" }, usage: { input: 10, output: 1 } },
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 10, output: 1 } },
+		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } },
+	]);
+	assert.equal(result.valid_output, true);
+	const timing = result.stage_timing;
+	assert.ok(timing);
+	for (const field of ["sandbox_validate_seconds", "sandbox_preflight_seconds", "bash_wall_seconds"] as const) {
+		assert.equal(typeof timing[field], "number");
+		assert.ok((timing[field] as number) >= 0);
+	}
+	assert.equal(timing.bash_calls, 2);
+	assert.deepEqual(result.trace?.stage_timing, timing);
+});
+
+test("v2 required read consumes one of twelve search turns before finalization", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const steps: MockStep[] = [];
+	for (let index = 0; index < 6; index++) {
+		steps.push({ type: "tool_call", name: "bash", arguments: { command: `true # search-${index}` }, usage: { input: 10, output: 1 } });
+	}
+	steps.push({ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 10, output: 1 } });
+	for (let index = 0; index < 5; index++) {
+		steps.push({ type: "tool_call", name: "bash", arguments: { command: `true # post-read-${index}` }, usage: { input: 10, output: 1 } });
+	}
+	steps.push({ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } });
+	const result = await runV2Mock(steps);
+	assert.equal(result.valid_output, true);
+	assert.equal(result.search_turns, 12);
+	assert.equal(result.tool_invocations, 12);
+	assert.equal(result.agent_steps, 13);
+	assert.equal(result.repair_attempts, 0);
+});
+
+test("v2 permits exactly one final repair after a completed read phase", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const read: MockStep = { type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 10, output: 1 } };
+	const result = await runV2Mock([
+		read, read, read,
+		{ type: "final", text: "not-json", usage: { input: 10, output: 1 } },
+		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } },
+	]);
+	assert.equal(result.valid_output, true);
+	assert.equal(result.repair_attempts, 1);
+	assert.equal(result.tool_invocations, 3);
+});
+
+test("v2 cannot accept a final answer without nonempty read evidence", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const steps: MockStep[] = Array.from({ length: 6 }, () => ({
+		type: "tool_call", name: "bash", arguments: { command: "true" }, usage: { input: 10, output: 1 },
+	}));
+	steps.push({ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } });
+	steps.push({ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } });
+	const result = await runV2Mock(steps);
+	assert.equal(result.valid_output, false);
+	assert.equal(result.failure?.kind, "tool_failure");
+	assert.equal(result.repair_attempts, 0);
+});
+
+test("v2 reports a cumulative token overrun before final acceptance", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 64000, output: 1 } },
+		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 1, output: 1 } },
+	]);
+	assert.equal(result.valid_output, false);
+	assert.equal(result.failure?.kind, "token_limit");
+});
+
+test("v2 low calibration budget finalizes or returns a structured token failure", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 27000, output: 1 } },
+		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } },
+	], "32000");
+	assert.ok(result.valid_output === true || result.failure?.kind === "token_limit");
 });

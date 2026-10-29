@@ -34,10 +34,15 @@ type CanonicalToolDefinition = {
 type BudgetControlPolicy = {
 	version: string;
 	reserve_tokens: number;
+	dynamic_reserve?: boolean;
 	forecast_bytes_per_token?: number;
 	forecast_request_safety_tokens?: number;
 	repeat_threshold: number;
 	max_search_turns_without_read: number;
+	max_search_turns?: number;
+	max_tool_invocations?: number;
+	max_final_repair_turns?: number;
+	max_agent_steps?: number;
 	max_required_read_turns: number;
 	initial_prompt: string;
 	loop_prompt: string;
@@ -47,12 +52,34 @@ type BudgetControlPolicy = {
 	final_repair_prompt: string;
 };
 
+type CandidatePoolPolicy = {
+	schema_version: string;
+	profile: string;
+	tier: string;
+	capacity: number;
+	max_total_model_tokens: number;
+	reserve_tokens: number;
+	context_window: number;
+	max_model_output_tokens: number;
+	max_final_output_tokens: number;
+	sample_timeout_seconds: number;
+	max_search_turns?: number;
+	max_tool_invocations?: number;
+	max_final_repair_turns?: number;
+	max_agent_steps?: number;
+	tool_result_max_bytes?: number;
+	id_policy: Record<string, unknown>;
+	retriever: Record<string, unknown>;
+};
+
 type CanonicalContract = {
 	evaluation_track?: "document" | "code";
 	benchmark_contract_version: string;
 	protocol_profile?: string;
+	candidate_pool?: CandidatePoolPolicy;
 	budget_control?: BudgetControlPolicy;
 	search_policy?: { version: string; ripgrep_config: string; prompt: string };
+	context_policy?: { max_total_model_tokens: number; context_window?: number; [key: string]: unknown };
 	pi_final_result_version: string;
 	trajectory_schema_version: string;
 	top_k: number;
@@ -74,24 +101,184 @@ type CanonicalContract = {
 	query_prompt_template: string;
 	task_instruction_template: string;
 	repair_prompt_template: string;
+	document_id_policy?: Record<string, unknown>;
 };
+
+type DocumentPoolConfig = {
+	schema_version: string;
+	scope: string;
+	id_policy: Record<string, unknown>;
+	retriever: Record<string, unknown>;
+	prompt_policy: Record<string, string>;
+	profiles: Record<string, { tier: string }>;
+	tiers: Record<string, Record<string, unknown>>;
+};
+
+function positiveDocumentPoolInt(value: unknown, field: string): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+		throw new Error(`Document pool ${field} must be a positive integer`);
+	}
+	return value;
+}
+
+function requiredDocumentPoolString(value: unknown, field: string): string {
+	if (typeof value !== "string" || !value) throw new Error(`Document pool ${field} must be a non-empty string`);
+	return value;
+}
+
+function rewriteDocumentIdPrompt(prompt: string, example: string): string {
+	const source = "l%27exemple.md";
+	const marker = "has original ID report.md.";
+	let rewritten = prompt;
+	let start = 0;
+	while (true) {
+		const sourceIndex = rewritten.indexOf(source, start);
+		if (sourceIndex < 0) break;
+		const markerIndex = rewritten.indexOf(marker, sourceIndex);
+		if (markerIndex < 0) throw new Error("Legacy ID prompt example is incomplete");
+		const end = markerIndex + marker.length;
+		rewritten = `${rewritten.slice(0, sourceIndex)}${example}.${rewritten.slice(end)}`;
+		start = sourceIndex + example.length + 1;
+	}
+	for (const [old, replacement] of [
+		["original document IDs", "document IDs"],
+		["original document ID", "document ID"],
+		["original document ids", "document ids"],
+		["original document id", "document id"],
+		["original corpus IDs", "corpus document IDs"],
+		["original corpus ID", "corpus document ID"],
+		["original IDs", "document IDs"],
+		["original ID", "document ID"],
+		["original doc_id", "doc_id"],
+	] as const) {
+		rewritten = rewritten.replaceAll(old, replacement);
+	}
+	return rewritten;
+}
+
+function resolveDocumentPool(profileName: string, tierReference: string): {
+	candidatePool: CandidatePoolPolicy;
+	budgetControl: Pick<BudgetControlPolicy, "reserve_tokens" | "initial_prompt" | "final_prompt" | "final_repair_prompt">;
+	idPromptExample: string;
+} {
+	const isV2 = profileName === "lite" || profileName === "full" || profileName.startsWith("document-pool-v2-") ||
+		tierReference === "lite" || tierReference === "full" || tierReference.startsWith("document-pool-v2-");
+	const configPath = join(dirname(CONTRACT_PATH), isV2 ? "document_pools_v2.json" : "document_pools.json");
+	const config = JSON.parse(readFileSync(configPath, "utf8")) as DocumentPoolConfig;
+	if (config.schema_version !== (isV2 ? "document-pool-v2" : "document-pool-v1") || config.scope !== "dataset-neutral") {
+		throw new Error("Unsupported document pool configuration");
+	}
+	const profile = config.profiles[profileName];
+	const referenceTier = tierReference.startsWith("document-pool-v2-") ? tierReference.slice("document-pool-v2-".length) : tierReference;
+	if (!profile || (tierReference !== profileName && profile.tier !== referenceTier)) {
+		throw new Error(`Document pool profile ${profileName} does not resolve to ${tierReference}`);
+	}
+	const tier = config.tiers[profile.tier];
+	if (!tier) throw new Error(`Missing document pool tier: ${profile.tier}`);
+	const capacity = positiveDocumentPoolInt(tier.capacity, `${profile.tier}.capacity`);
+	let maxTotal = positiveDocumentPoolInt(tier.max_total_model_tokens, `${profile.tier}.max_total_model_tokens`);
+	const rawTokenBudget = process.env.DCI_DOCUMENT_TOKEN_BUDGET;
+	if (isV2) {
+		if (rawTokenBudget !== undefined && !["32000", "64000", "96000"].includes(rawTokenBudget)) {
+			throw new Error("DCI_DOCUMENT_TOKEN_BUDGET must be one of 32000, 64000, or 96000");
+		}
+		maxTotal = rawTokenBudget === undefined ? maxTotal : Number(rawTokenBudget);
+	} else if (rawTokenBudget !== undefined) {
+		throw new Error("DCI_DOCUMENT_TOKEN_BUDGET is only valid for document-pool-v2 profiles");
+	}
+	const reserveRaw = tier.reserve_tokens;
+	let reserve: number;
+	if (isV2) {
+		if (typeof reserveRaw !== "number" || !Number.isSafeInteger(reserveRaw) || reserveRaw < 0) {
+			throw new Error(`Document pool ${profile.tier} reserve must be a non-negative integer`);
+		}
+		reserve = reserveRaw;
+	} else {
+		reserve = positiveDocumentPoolInt(reserveRaw, `${profile.tier}.reserve_tokens`);
+	}
+	const contextWindow = positiveDocumentPoolInt(tier.context_window, `${profile.tier}.context_window`);
+	const maxModelOutput = positiveDocumentPoolInt(tier.max_model_output_tokens, `${profile.tier}.max_model_output_tokens`);
+	const maxFinalOutput = positiveDocumentPoolInt(tier.max_final_output_tokens, `${profile.tier}.max_final_output_tokens`);
+	const timeout = positiveDocumentPoolInt(tier.sample_timeout_seconds, `${profile.tier}.sample_timeout_seconds`);
+	if (contextWindow !== 65536 || maxModelOutput !== 1024 || maxFinalOutput !== 1024 || timeout !== (isV2 ? 300 : 600)) {
+		throw new Error("Document pool limits changed outside the candidate-pool budget contract");
+	}
+	const maxSearchTurns = isV2 ? positiveDocumentPoolInt(tier.max_search_turns, `${profile.tier}.max_search_turns`) : undefined;
+	const maxToolInvocations = isV2 ? positiveDocumentPoolInt(tier.max_tool_invocations, `${profile.tier}.max_tool_invocations`) : undefined;
+	const maxFinalRepairTurns = isV2 ? positiveDocumentPoolInt(tier.max_final_repair_turns, `${profile.tier}.max_final_repair_turns`) : undefined;
+	const maxAgentSteps = isV2 ? positiveDocumentPoolInt(tier.max_agent_steps, `${profile.tier}.max_agent_steps`) : undefined;
+	const toolResultMaxBytes = isV2 ? positiveDocumentPoolInt(tier.tool_result_max_bytes, `${profile.tier}.tool_result_max_bytes`) : undefined;
+	if (isV2 && (maxSearchTurns !== 12 || maxToolInvocations !== 24 || maxFinalRepairTurns !== 1 || maxAgentSteps !== 14 || toolResultMaxBytes !== 8192)) {
+		throw new Error("Document pool v2 controls changed outside the candidate-pool budget contract");
+	}
+	if (reserve > maxTotal) throw new Error(`Document pool ${profile.tier} reserve exceeds total budget`);
+	const idPolicy = config.id_policy;
+	if (idPolicy.version !== "short-document-id-v1") {
+		throw new Error("Document pool id_policy must declare short document aliases");
+	}
+	const idPromptExample = requiredDocumentPoolString(idPolicy.filename_to_id_example, "id_policy.filename_to_id_example");
+	if (idPromptExample !== "d000001.md -> d000001") throw new Error("Document pool short ID example is invalid");
+	const promptPolicy = config.prompt_policy;
+	const initialTemplate = requiredDocumentPoolString(promptPolicy.initial_prompt_template, "prompt_policy.initial_prompt_template");
+	const finalPrompt = requiredDocumentPoolString(promptPolicy.final_prompt, "prompt_policy.final_prompt");
+	const finalRepairPrompt = requiredDocumentPoolString(promptPolicy.final_repair_prompt, "prompt_policy.final_repair_prompt");
+	if (!initialTemplate.includes("{max_total_model_tokens}") ||
+		!finalPrompt.includes(idPromptExample) || !finalRepairPrompt.includes(idPromptExample)) {
+		throw new Error("Document pool prompts do not match the short ID and budget policy");
+	}
+	const resolvedProfile = isV2 ? `document-pool-v2-${profile.tier}` : profileName;
+	return {
+		candidatePool: {
+			schema_version: config.schema_version,
+			profile: resolvedProfile,
+			tier: profile.tier,
+			capacity,
+			max_total_model_tokens: maxTotal,
+			reserve_tokens: reserve,
+			context_window: contextWindow,
+			max_model_output_tokens: maxModelOutput,
+			max_final_output_tokens: maxFinalOutput,
+			sample_timeout_seconds: timeout,
+			...(isV2 ? {
+				max_search_turns: maxSearchTurns,
+				max_tool_invocations: maxToolInvocations,
+				max_final_repair_turns: maxFinalRepairTurns,
+				max_agent_steps: maxAgentSteps,
+				tool_result_max_bytes: toolResultMaxBytes,
+			} : {}),
+			id_policy: config.id_policy,
+			retriever: config.retriever,
+		},
+		budgetControl: {
+			reserve_tokens: reserve,
+			initial_prompt: initialTemplate.replace("{max_total_model_tokens}", String(maxTotal)),
+			final_prompt: finalPrompt,
+			final_repair_prompt: finalRepairPrompt,
+		},
+		idPromptExample,
+	};
+}
 
 const CONTRACT_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "../../dci_bench/protocol/contract.json");
 const EVALUATION_TRACK = process.env.DCI_EVALUATION_TRACK ?? "document";
 if (EVALUATION_TRACK !== "document" && EVALUATION_TRACK !== "code") throw new Error("Unknown DCI_EVALUATION_TRACK");
 const codeContractPath = process.env.DCI_CODE_RUNTIME_CONTRACT;
 if (EVALUATION_TRACK === "code" && !codeContractPath) throw new Error("Code evaluation requires DCI_CODE_RUNTIME_CONTRACT");
-const DEFAULT_CONTRACT = JSON.parse(readFileSync(EVALUATION_TRACK === "code" ? codeContractPath! : CONTRACT_PATH, "utf8")) as CanonicalContract;
+export const DEFAULT_CONTRACT = JSON.parse(readFileSync(EVALUATION_TRACK === "code" ? codeContractPath! : CONTRACT_PATH, "utf8")) as CanonicalContract;
 if (EVALUATION_TRACK === "code" && (DEFAULT_CONTRACT.evaluation_track !== "code" || DEFAULT_CONTRACT.budget_control)) {
 	throw new Error("Code runtime contract must declare evaluation_track=code and must not copy document budget_control");
 }
 const PROTOCOL_PROFILE = EVALUATION_TRACK === "code" ? "code-v1" : process.env.DCI_PROTOCOL_PROFILE ?? "v3";
+if (process.env.DCI_DOCUMENT_TOKEN_BUDGET !== undefined &&
+	(PROTOCOL_PROFILE === "v3" || (PROTOCOL_PROFILE !== "lite" && PROTOCOL_PROFILE !== "full" && !PROTOCOL_PROFILE.startsWith("document-pool-v2-")))) {
+	throw new Error("DCI_DOCUMENT_TOKEN_BUDGET is only valid for document-pool-v2 profiles");
+}
 if (EVALUATION_TRACK === "document" && PROTOCOL_PROFILE !== "v3") {
 	const profiles = JSON.parse(readFileSync(join(dirname(CONTRACT_PATH), "pilot_profiles.json"), "utf8")) as Record<
 		string,
 		{ benchmark_contract_version?: string; generation_config?: Partial<CanonicalContract["generation_config"]>; budget_control?: string;
 			budget_control_overrides?: Partial<BudgetControlPolicy>; policy?: BudgetControlPolicy;
-			search_policy?: string | CanonicalContract["search_policy"] }
+			search_policy?: string | CanonicalContract["search_policy"]; candidate_pool?: string }
 	>;
 	const profile = profiles[PROTOCOL_PROFILE];
 	if (!profile || PROTOCOL_PROFILE.startsWith("_")) throw new Error(`Unknown DCI_PROTOCOL_PROFILE: ${PROTOCOL_PROFILE}`);
@@ -111,12 +298,68 @@ if (EVALUATION_TRACK === "document" && PROTOCOL_PROFILE !== "v3") {
 			throw new Error("stable-rg.conf does not match the protocol search policy");
 		}
 	}
+	if (profile.candidate_pool) {
+		const resolved = resolveDocumentPool(PROTOCOL_PROFILE, profile.candidate_pool);
+		if (!DEFAULT_CONTRACT.budget_control) throw new Error("Candidate-pool profiles require budget_control");
+		if (!DEFAULT_CONTRACT.context_policy) throw new Error("Candidate-pool profiles require context_policy");
+		DEFAULT_CONTRACT.candidate_pool = resolved.candidatePool;
+		DEFAULT_CONTRACT.max_total_model_tokens = resolved.candidatePool.max_total_model_tokens;
+		DEFAULT_CONTRACT.context_policy.max_total_model_tokens = resolved.candidatePool.max_total_model_tokens;
+		DEFAULT_CONTRACT.context_policy.context_window = resolved.candidatePool.context_window;
+		Object.assign(DEFAULT_CONTRACT.budget_control, resolved.budgetControl);
+		if (resolved.candidatePool.schema_version === "document-pool-v2") {
+			DEFAULT_CONTRACT.max_agent_steps = resolved.candidatePool.max_agent_steps!;
+			DEFAULT_CONTRACT.max_final_repair_turns = resolved.candidatePool.max_final_repair_turns!;
+			DEFAULT_CONTRACT.sample_timeout_seconds = resolved.candidatePool.sample_timeout_seconds;
+			DEFAULT_CONTRACT.tool_result_max_bytes = resolved.candidatePool.tool_result_max_bytes!;
+			DEFAULT_CONTRACT.max_model_output_tokens = resolved.candidatePool.max_model_output_tokens;
+			DEFAULT_CONTRACT.max_final_output_tokens = resolved.candidatePool.max_final_output_tokens;
+			if (DEFAULT_CONTRACT.context_policy) {
+				DEFAULT_CONTRACT.context_policy.max_model_output_tokens = resolved.candidatePool.max_model_output_tokens;
+				DEFAULT_CONTRACT.context_policy.max_final_output_tokens = resolved.candidatePool.max_final_output_tokens;
+			}
+			Object.assign(DEFAULT_CONTRACT.budget_control, {
+				max_search_turns: resolved.candidatePool.max_search_turns,
+				max_tool_invocations: resolved.candidatePool.max_tool_invocations,
+				max_final_repair_turns: resolved.candidatePool.max_final_repair_turns,
+				max_agent_steps: resolved.candidatePool.max_agent_steps,
+			});
+			for (const tool of DEFAULT_CONTRACT.tool_definitions) {
+				tool.result_max_bytes = resolved.candidatePool.tool_result_max_bytes!;
+				tool.description = tool.description.replaceAll("20000 UTF-8 bytes", `${resolved.candidatePool.tool_result_max_bytes} UTF-8 bytes`);
+			}
+		}
+		for (const key of ["system_prompt", "query_prompt_template", "repair_prompt_template"] as const) {
+			DEFAULT_CONTRACT[key] = rewriteDocumentIdPrompt(DEFAULT_CONTRACT[key], resolved.idPromptExample);
+		}
+		for (const tool of DEFAULT_CONTRACT.tool_definitions) {
+			tool.description = rewriteDocumentIdPrompt(tool.description, resolved.idPromptExample);
+		}
+		for (const key of ["initial_prompt", "loop_prompt", "read_prompt", "resume_prompt", "final_prompt", "final_repair_prompt"] as const) {
+			DEFAULT_CONTRACT.budget_control[key] = rewriteDocumentIdPrompt(
+				DEFAULT_CONTRACT.budget_control[key], resolved.idPromptExample,
+			);
+		}
+		if (DEFAULT_CONTRACT.document_id_policy) {
+			for (const [key, value] of Object.entries(DEFAULT_CONTRACT.document_id_policy)) {
+				if (typeof value === "string") DEFAULT_CONTRACT.document_id_policy[key] = rewriteDocumentIdPrompt(value, resolved.idPromptExample);
+			}
+		}
+	}
 }
-const CONTRACT_SHA256 = createHash("sha256").update(JSON.stringify(sortJsonKeys(DEFAULT_CONTRACT))).digest("hex");
+export const CONTRACT_SHA256 = createHash("sha256").update(JSON.stringify(sortJsonKeys(DEFAULT_CONTRACT))).digest("hex");
 if (process.env.DCI_PROTOCOL_CONTRACT_SHA256 && process.env.DCI_PROTOCOL_CONTRACT_SHA256 !== CONTRACT_SHA256) {
 	throw new Error("Python/Pi protocol contract hash mismatch");
 }
 const PROCESS_STARTED_AT = Date.now();
+
+function monotonicNow(): bigint {
+	return process.hrtime.bigint();
+}
+
+function elapsedSeconds(start: bigint): number {
+	return Math.max(0, Number(monotonicNow() - start) / 1_000_000_000);
+}
 
 type Args = {
 	codeFiles?: string;
@@ -139,6 +382,7 @@ type Args = {
 
 type MockStep =
 	| { type: "tool_call"; name: string; arguments: Record<string, unknown>; id?: string; usage?: MockUsage }
+	| { type: "tool_calls"; calls: Array<{ name: string; arguments: Record<string, unknown>; id?: string }>; usage?: MockUsage }
 	| { type: "final"; text: string; usage?: MockUsage };
 
 type MockUsage = {
@@ -341,6 +585,7 @@ function parseArgs(argv: string[]): Args {
 	if (deadlineAtMs !== undefined && (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= 0)) {
 		throw new Error("--deadline-at-ms must be a positive epoch timestamp");
 	}
+	const defaultContextWindow = DEFAULT_CONTRACT.candidate_pool?.context_window ?? DEFAULT_CONTRACT.max_total_model_tokens;
 	return {
 		codeFiles: EVALUATION_TRACK === "code" ? required("code-files") : undefined,
 		preflightOnly,
@@ -356,7 +601,7 @@ function parseArgs(argv: string[]): Args {
 		openaiApiKey: String(values.get("openai-api-key") ?? process.env.OPENAI_API_KEY ?? "inspect"),
 		model: String(values.get("model") ?? "inspect"),
 		maxAgentSteps: positiveInt("max-agent-steps", DEFAULT_CONTRACT.max_agent_steps),
-		contextWindow: positiveInt("context-window", DEFAULT_CONTRACT.max_total_model_tokens),
+		contextWindow: positiveInt("context-window", defaultContextWindow),
 		timeoutSeconds,
 		deadlineAtMs,
 	};
@@ -689,6 +934,8 @@ type EvidenceState = {
 		start_line?: number; end_line?: number; last_line_complete?: boolean; returned_bytes: number; content_sha256: string }>;
 };
 
+type BashTiming = { wallSeconds: number; calls: number };
+
 // Recover IDs only from trusted workspace filenames, never from submitted IDs.
 // This preserves original IDs such as report.md, a%2Fb and 100% exactly.
 export function corpusDocumentIds(filenames: string[]): { ids: Set<string>; aliases: Map<string, string> } {
@@ -913,7 +1160,12 @@ export function createCodeReadTool(sandbox: CorpusSandbox, evidence: EvidenceSta
 	};
 }
 
-export function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence: EvidenceState): AgentTool<typeof bashSchema> {
+export function createBashTool(
+	sandbox: CorpusSandbox,
+	scratch: string,
+	evidence: EvidenceState,
+	bashTiming?: BashTiming,
+): AgentTool<typeof bashSchema> {
 	return {
 		name: "bash",
 		label: "bash",
@@ -922,6 +1174,8 @@ export function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence
 		executionMode: "sequential",
 		prepareArguments: (args) => Value.Parse(bashSchema, args),
 		execute: async (_toolCallId, params, signal) => {
+			const bashStarted = bashTiming ? monotonicNow() : undefined;
+			if (bashTiming) bashTiming.calls++;
 			const timeoutMs = Math.min(60, Math.max(1, Math.floor(params.timeout_seconds ?? 10))) * 1000;
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -1015,6 +1269,7 @@ export function createBashTool(sandbox: CorpusSandbox, scratch: string, evidence
 				return { content: [{ type: "text", text }], details: { exitCode, bodyEvidence }, terminate: false };
 			} finally {
 				clearTimeout(timeout);
+				if (bashTiming && bashStarted !== undefined) bashTiming.wallSeconds += elapsedSeconds(bashStarted);
 			}
 		},
 	};
@@ -1185,7 +1440,8 @@ function estimateNextInputTokens(context: Context, conservative = false, bytesPe
 }
 
 export function estimateBudgetReserve(context: Context, policy: Pick<BudgetControlPolicy,
-	"reserve_tokens" | "forecast_bytes_per_token" | "forecast_request_safety_tokens">) {
+	"reserve_tokens" | "forecast_bytes_per_token" | "forecast_request_safety_tokens"> &
+	Partial<Pick<BudgetControlPolicy, "dynamic_reserve">>) {
 	// Defaults preserve the v5 control arm exactly. Calibration affects only
 	// early finalization, never the conservative pre-dispatch or actual-usage guards.
 	const bytesPerToken = policy.forecast_bytes_per_token ?? 1;
@@ -1197,13 +1453,23 @@ export function estimateBudgetReserve(context: Context, policy: Pick<BudgetContr
 	const requestOverhead = DEFAULT_CONTRACT.max_model_output_tokens + safetyTokens;
 	const nextRequest = nextInput + requestOverhead;
 	const toolGrowth = Math.ceil(DEFAULT_CONTRACT.tool_result_max_bytes / bytesPerToken);
-	// Pay for one search/read, final submission and one repair. The next tool
-	// result is replayed in both later requests. Multiple large tool results and
-	// further repairs may cost more; actual usage remains the hard authority.
-	const afterSearchInput = nextInput + DEFAULT_CONTRACT.max_model_output_tokens + toolGrowth;
-	const reserve = Math.max(policy.reserve_tokens,
-		nextRequest + (afterSearchInput + requestOverhead) +
+	let reserve: number;
+	if (policy.dynamic_reserve) {
+		// V2 reserves only the final submission and one repair from the current
+		// history. The reserve is a threshold inside the cumulative budget; it is
+		// never added to actual usage. A final response becomes repair history, so
+		// include one output allowance in the repair request input estimate.
+		const finalRequest = nextInput + requestOverhead;
+		const repairRequest = nextInput + DEFAULT_CONTRACT.max_model_output_tokens + requestOverhead;
+		reserve = Math.max(policy.reserve_tokens, finalRequest + repairRequest);
+	} else {
+		// Preserve the v5 control arm exactly: reserve one search/read, final
+		// submission and one repair, including the next tool result replay.
+		const afterSearchInput = nextInput + DEFAULT_CONTRACT.max_model_output_tokens + toolGrowth;
+		reserve = Math.max(policy.reserve_tokens,
+			nextRequest + (afterSearchInput + requestOverhead) +
 			(afterSearchInput + DEFAULT_CONTRACT.max_model_output_tokens + requestOverhead));
+	}
 	return { nextInput, nextRequest, toolGrowth, safetyTokens, bytesPerToken, reserve };
 }
 
@@ -1231,10 +1497,13 @@ async function createMockStreamFn(mockScript: string): Promise<StreamFn> {
 				stream.end(msg);
 				return;
 			}
-			const message =
-				step.type === "tool_call"
-					? fauxAssistantMessage([fauxToolCall(step.name, step.arguments, { id: step.id })], { stopReason: "toolUse" })
-					: fauxAssistantMessage(step.text, { stopReason: "stop" });
+			const message = step.type === "final"
+				? fauxAssistantMessage(step.text, { stopReason: "stop" })
+				: fauxAssistantMessage(
+					(step.type === "tool_call" ? [step] : step.calls).map((call) =>
+						fauxToolCall(call.name, call.arguments, { id: call.id })),
+					{ stopReason: "toolUse" },
+				);
 			message.provider = model.provider;
 			message.model = model.id;
 			message.api = model.api;
@@ -1442,7 +1711,10 @@ async function main() {
 	const args = parseArgs(process.argv.slice(2));
 	const deadlineAt = Math.min(PROCESS_STARTED_AT + args.timeoutSeconds * 1000, args.deadlineAtMs ?? Infinity);
 	const codeFiles = args.codeFiles ? parseCodeFiles(JSON.parse(await readFile(resolve(args.codeFiles), "utf8"))) : undefined;
+	const isV2 = DEFAULT_CONTRACT.candidate_pool?.schema_version === "document-pool-v2";
+	const sandboxValidateStarted = isV2 ? monotonicNow() : undefined;
 	const sandbox = await validateCorpusSandbox(resolve(args.workspace), codeFiles);
+	const sandboxValidateSeconds = sandboxValidateStarted === undefined ? 0 : elapsedSeconds(sandboxValidateStarted);
 	if (codeFiles) {
 		for (const metadataPath of [args.codeFiles!, codeContractPath!]) {
 			const canonical = await realpath(metadataPath);
@@ -1451,7 +1723,9 @@ async function main() {
 			}
 		}
 	}
+	const sandboxPreflightStarted = isV2 ? monotonicNow() : undefined;
 	await runSandboxPreflight(sandbox);
+	const sandboxPreflightSeconds = sandboxPreflightStarted === undefined ? 0 : elapsedSeconds(sandboxPreflightStarted);
 	if (args.preflightOnly) {
 		console.log(`bubblewrap corpus sandbox preflight passed: ${sandbox.corpus}`);
 		return;
@@ -1479,6 +1753,13 @@ async function main() {
 		const corpusIds = codeFiles ? undefined : corpusDocumentIds(await readdir(sandbox.corpus));
 		const repairReasons: string[] = [];
 		const budgetPolicy = DEFAULT_CONTRACT.budget_control;
+		const bashTiming: BashTiming | undefined = isV2 ? { wallSeconds: 0, calls: 0 } : undefined;
+		const stageTiming = isV2 ? () => ({
+			sandbox_validate_seconds: sandboxValidateSeconds,
+			sandbox_preflight_seconds: sandboxPreflightSeconds,
+			bash_wall_seconds: bashTiming!.wallSeconds,
+			bash_calls: bashTiming!.calls,
+		}) : undefined;
 		const controlEvents: Array<Record<string, unknown>> = [];
 		let finalizing = false;
 		let requiringRead = false;
@@ -1486,11 +1767,14 @@ async function main() {
 		let lastToolSignature = "";
 		let identicalCalls = 0;
 		let pendingControl: string | undefined;
+		let searchTurns = 0;
+		let toolInvocationAttempts = 0;
+		let toolInvocations = 0;
 		const model = createModel(args.modelProvider, args.model, args.openaiBaseUrl, args.contextWindow);
 		const baseStreamFn =
 			args.modelProvider === "mock" ? await createMockStreamFn(args.mockScript!) : createBridgeStreamFn(args);
 		const readTool = codeFiles ? createCodeReadTool(sandbox, evidence) : createReadTool(sandbox, evidence);
-		const searchTools = [readTool, createBashTool(sandbox, scratch, evidence)];
+		const searchTools = [readTool, createBashTool(sandbox, scratch, evidence, bashTiming)];
 		const agent = new Agent({
 			streamFn: (currentModel, context, options) =>
 				baseStreamFn(currentModel, context, {
@@ -1503,6 +1787,13 @@ async function main() {
 				tools: searchTools,
 			},
 			toolExecution: "sequential",
+			beforeToolCall: async () => {
+				const maxToolInvocations = budgetPolicy?.max_tool_invocations;
+				if (maxToolInvocations !== undefined && toolInvocationAttempts > maxToolInvocations) {
+					return { block: true, terminate: true, reason: "v2 tool invocation cap reached before execution" };
+				}
+				return undefined;
+			},
 			shouldStopAfterTurn: async ({ message, context }) => {
 				turns++;
 				if (structuredFailure) return true;
@@ -1546,6 +1837,12 @@ async function main() {
 				if (finalizing) return true;
 				if (budgetPolicy) {
 					const calls = message.content.filter((part): part is ToolCall => part.type === "toolCall");
+					const v2Budget = budgetPolicy.max_search_turns !== undefined;
+					if (calls.length > 0 && (v2Budget || !requiringRead)) searchTurns++;
+					const maxSearchTurns = budgetPolicy.max_search_turns;
+					const maxToolInvocations = budgetPolicy.max_tool_invocations;
+					const searchCapReached = maxSearchTurns !== undefined && searchTurns >= maxSearchTurns;
+					const toolCapReached = maxToolInvocations !== undefined && toolInvocations >= maxToolInvocations;
 					for (const call of calls) {
 						const signature = JSON.stringify([call.name, sortJsonKeys(call.arguments)]);
 						identicalCalls = signature === lastToolSignature ? identicalCalls + 1 : 1;
@@ -1559,9 +1856,27 @@ async function main() {
 					const repeating = calls.length > 0 && identicalCalls >= budgetPolicy.repeat_threshold;
 					const lowBudget = remaining <= reserve;
 					const remainingSeconds = Math.max(0, (deadlineAt - Date.now()) / 1000);
+					if (toolCapReached && !hasEvidence) {
+						structuredFailure = makeFailure("tool_failure", "v2 tool invocation cap reached before a nonempty corpus read receipt");
+						return true;
+					}
+					if (v2Budget && searchCapReached && !hasEvidence) {
+						structuredFailure = makeFailure("tool_failure", "v2 search assistant turn cap reached before a nonempty corpus read receipt");
+						return true;
+					}
+					if (hasEvidence && (searchCapReached || toolCapReached)) {
+						requiringRead = false;
+						finalizing = true;
+						const reason = searchCapReached ? "maximum search assistant turns reached" : "maximum tool invocations reached";
+						pendingControl = budgetPolicy.final_prompt.replace("{reason}", reason).replace("{remaining_tokens}", String(remaining));
+						controlEvents.push({ action: "finalize", reason, turn: turns, remaining_tokens: remaining,
+							reserve_tokens: reserve, forecast, remaining_seconds: remainingSeconds, tool_invocations: toolInvocations,
+							search_turns: searchTurns, tool_choice: "none" });
+						return true;
+					}
 					// Time is a hard timeout only. It must not alter the search policy
 					// or turn a slow first request into a forced final answer.
-					if (hasEvidence && requiringRead && !lowBudget) {
+					if (hasEvidence && requiringRead && !lowBudget && !searchCapReached && !toolCapReached) {
 						requiringRead = false;
 						requiredReadTurns = 0;
 						identicalCalls = 0;
@@ -1595,7 +1910,7 @@ async function main() {
 						}
 						return true;
 					}
-					if (!hasEvidence && (repeating || lowBudget || turns >= budgetPolicy.max_search_turns_without_read)) {
+					if (!hasEvidence && (repeating || lowBudget || searchCapReached || turns >= budgetPolicy.max_search_turns_without_read)) {
 						requiringRead = true;
 						pendingControl = budgetPolicy.read_prompt.replace("{remaining_tokens}", String(remaining));
 						controlEvents.push({ action: "require_read", reason: repeating ? "repeated_tool" : lowBudget ? "low_budget" : "search_turn_limit",
@@ -1632,10 +1947,17 @@ async function main() {
 				task_instruction: taskInstruction, failure: structuredFailure,
 				usage_summary: usageSummary(messages, observedTokens), usage_by_turn: usageByTurn(messages),
 				events, messages, body_evidence: { read_receipts: evidence.readReceipts },
-			});
+				...(stageTiming ? { stage_timing: stageTiming() } : {}),
+				});
 		};
 		persistTrace();
 		agent.subscribe((event: AgentEvent) => {
+			if (event.type === "tool_execution_start") {
+				toolInvocationAttempts++;
+				toolInvocations = budgetPolicy?.max_tool_invocations === undefined
+					? toolInvocationAttempts
+					: Math.min(toolInvocationAttempts, budgetPolicy.max_tool_invocations);
+			}
 			if (event.type === "turn_end" || event.type === "tool_execution_start" || event.type === "tool_execution_end") {
 				events.push(event);
 			}
@@ -1709,7 +2031,9 @@ async function main() {
 			finalIssue = runtimeFinalIssue(parsed, evidence, corpusIds);
 		}
 		const acceptedParsed = !structuredFailure && parsed !== undefined && finalIssue === undefined ? parsed : undefined;
-		const toolCalls = agent.state.messages.filter((message) => message.role === "toolResult").length;
+		const toolCalls = budgetPolicy?.max_tool_invocations !== undefined
+			? toolInvocations
+			: agent.state.messages.filter((message) => message.role === "toolResult").length;
 		const failure = structuredFailure ??
 			(acceptedParsed
 				? null
@@ -1735,11 +2059,13 @@ async function main() {
 			raw_final_text: finalText,
 			agent_steps: turns,
 			tool_calls: toolCalls,
+			...(budgetPolicy?.max_tool_invocations !== undefined ? { tool_invocations: toolInvocations, search_turns: searchTurns } : {}),
 			final_output_adapter: acceptedParsed && "adapter" in acceptedParsed ? acceptedParsed.adapter : null,
 			repair_attempts: repairReasons.length,
 			repair_reasons: repairReasons,
 			usage_summary: usage,
 			usage,
+			...(stageTiming ? { stage_timing: stageTiming() } : {}),
 			body_evidence: {
 				read_files: [...evidence.bodyReadFiles].sort(),
 				content_search_commands: evidence.contentSearchCommands,
@@ -1759,6 +2085,7 @@ async function main() {
 				max_final_output_tokens: DEFAULT_CONTRACT.max_final_output_tokens,
 				max_model_output_tokens: DEFAULT_CONTRACT.max_model_output_tokens,
 				generation_config: DEFAULT_CONTRACT.generation_config,
+				...(DEFAULT_CONTRACT.candidate_pool ? { candidate_pool: DEFAULT_CONTRACT.candidate_pool } : {}),
 				...(budgetPolicy ? { budget_control: budgetPolicy } : {}),
 				...(DEFAULT_CONTRACT.search_policy ? { search_policy: DEFAULT_CONTRACT.search_policy } : {}),
 				max_final_repair_turns: DEFAULT_CONTRACT.max_final_repair_turns,
@@ -1767,6 +2094,10 @@ async function main() {
 				tool_allowlist: DEFAULT_CONTRACT.tool_allowlist,
 				tool_sandbox: "bubblewrap",
 				max_scratch_bytes: DEFAULT_CONTRACT.max_scratch_bytes,
+				...(DEFAULT_CONTRACT.candidate_pool?.max_search_turns !== undefined ? {
+					max_search_turns: DEFAULT_CONTRACT.candidate_pool.max_search_turns,
+					max_tool_invocations: DEFAULT_CONTRACT.candidate_pool.max_tool_invocations,
+				} : {}),
 			},
 		};
 		writeJsonAtomicSync(output, result);
@@ -1774,28 +2105,29 @@ async function main() {
 			writeJsonAtomicSync(
 				trace,
 				{
-						...(codeFiles ? { evaluation_track: "code" } : {}),
-						schema_version: DEFAULT_CONTRACT.trajectory_schema_version,
-						argv: redactArgv(process.argv.slice(2)),
-						cwd: process.cwd(),
-						workspace: sandbox.workspace,
-						output,
-						inspect_sandbox: "local",
-						tool_sandbox: "bubblewrap",
-						contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
-						protocol_profile: PROTOCOL_PROFILE,
-						base_contract_sha256: CONTRACT_SHA256,
-						control_events: controlEvents,
-						task_instruction: taskInstruction,
-						started_at: startedAt,
-						completed_at: completedAt,
-						failure,
-						usage_summary: usage,
-						usage,
-						usage_by_turn: usageByTurn(messageSnapshot),
-						body_evidence: result.body_evidence,
-						events,
-						messages: agent.state.messages,
+					...(codeFiles ? { evaluation_track: "code" } : {}),
+					schema_version: DEFAULT_CONTRACT.trajectory_schema_version,
+					argv: redactArgv(process.argv.slice(2)),
+					cwd: process.cwd(),
+					workspace: sandbox.workspace,
+					output,
+					inspect_sandbox: "local",
+					tool_sandbox: "bubblewrap",
+					contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
+					protocol_profile: PROTOCOL_PROFILE,
+					base_contract_sha256: CONTRACT_SHA256,
+					control_events: controlEvents,
+					task_instruction: taskInstruction,
+					started_at: startedAt,
+					completed_at: completedAt,
+					failure,
+					usage_summary: usage,
+					usage,
+					usage_by_turn: usageByTurn(messageSnapshot),
+					...(stageTiming ? { stage_timing: stageTiming() } : {}),
+					body_evidence: result.body_evidence,
+					events,
+					messages: agent.state.messages,
 					},
 			);
 		}
