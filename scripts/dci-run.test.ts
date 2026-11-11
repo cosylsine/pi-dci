@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { fauxAssistantMessage, type Context, type Model } from "@earendil-works/pi-ai";
-import { corpusDocumentIds, createBridgeStreamFn, createReadTool, documentIdIssue, estimateBudgetReserve, parseFinalJson, truncate, utf8Prefix } from "./dci-run.ts";
+import { corpusDocumentIds, createBridgeStreamFn, createReadTool, documentIdIssue, estimateBudgetReserve, parseFinalJson, parseTimeoutSeconds, truncate, utf8Prefix } from "./dci-run.ts";
 
 const PI_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DCI_RUN = join(dirname(fileURLToPath(import.meta.url)), "dci-run.ts");
@@ -27,13 +27,15 @@ type StageTiming = {
 	bash_wall_seconds?: unknown;
 	bash_calls?: unknown;
 };
+type ControlEvent = { remaining_seconds?: unknown };
 type RunnerResult = Record<string, unknown> & {
 	failure?: { kind?: string } | null;
+	contract?: { sample_timeout_seconds?: unknown };
 	stage_timing?: StageTiming;
-	trace?: { events?: TraceEvent[]; stage_timing?: StageTiming };
+	trace?: { events?: TraceEvent[]; stage_timing?: StageTiming; control_events?: ControlEvent[] };
 };
 
-async function runV2Mock(steps: MockStep[], tokenBudget?: string): Promise<RunnerResult> {
+async function runV2Mock(steps: MockStep[], tokenBudget?: string, timeoutSeconds: string | null = "30"): Promise<RunnerResult> {
 	const root = await mkdtemp(join(tmpdir(), "dci-v2-transcript-"));
 	try {
 		const workspace = join(root, "workspace");
@@ -49,9 +51,10 @@ async function runV2Mock(steps: MockStep[], tokenBudget?: string): Promise<Runne
 		delete environment.DCI_PROTOCOL_CONTRACT_SHA256;
 		if (tokenBudget === undefined) delete environment.DCI_DOCUMENT_TOKEN_BUDGET;
 		else environment.DCI_DOCUMENT_TOKEN_BUDGET = tokenBudget;
+		const timeoutArgs = timeoutSeconds === null ? [] : ["--timeout-seconds", timeoutSeconds];
 		const child = spawn(process.execPath, ["--import", "tsx", DCI_RUN,
 			"--query-file", query, "--workspace", workspace, "--output", output,
-			"--trace", trace, "--mock-script", mock, "--model", "mock", "--timeout-seconds", "30"],
+			"--trace", trace, "--mock-script", mock, "--model", "mock", ...timeoutArgs],
 			{ cwd: PI_ROOT, env: environment, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
@@ -93,6 +96,17 @@ test("calibrated reserve uses observed usage and UTF-8 growth while preserving t
 	for (const ratio of [0, -1, Number.NaN]) {
 		assert.throws(() => estimateBudgetReserve(context, { reserve_tokens: 32000, forecast_bytes_per_token: ratio }));
 	}
+});
+
+test("timeout parser accepts unlimited aliases and preserves positive limits", () => {
+	assert.equal(parseTimeoutSeconds(undefined, null, true), null);
+	assert.equal(parseTimeoutSeconds("none", 600, true), null);
+	assert.equal(parseTimeoutSeconds("NULL", 600, true), null);
+	assert.equal(parseTimeoutSeconds("12.5", null, true), 12.5);
+	assert.equal(parseTimeoutSeconds(undefined, 600, false), 600);
+	assert.throws(() => parseTimeoutSeconds("none", 600, false), /must be positive$/);
+	assert.throws(() => parseTimeoutSeconds(true, 600, true), /positive or none/);
+	assert.throws(() => parseTimeoutSeconds("0", 600, true), /positive or none/);
 });
 
 test("read accepts exact corpus filenames without decoding or opening paths outside corpus", async () => {
@@ -256,6 +270,24 @@ test("v2 stops after twelve search assistant turns and preserves a final turn", 
 	assert.equal(result.tool_invocations, 12);
 	assert.equal(result.agent_steps, 13);
 	assert.equal(result.repair_attempts, 0);
+});
+
+test("v2 accepts an unlimited sample timeout and records no wall-clock remainder", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const steps: MockStep[] = [];
+	for (let offset = 0; offset < 12; offset++) {
+		steps.push({ type: "tool_call", name: "read", arguments: { path: "doc.md", offset, limit: 4 }, usage: { input: 10, output: 1 } });
+	}
+	steps.push({ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } });
+	for (const timeoutSeconds of [null, "none", "null"] as const) {
+		const result = await runV2Mock(steps, undefined, timeoutSeconds);
+		assert.equal(result.valid_output, true);
+		assert.equal(result.contract?.sample_timeout_seconds, null);
+		const controlEvents = result.trace?.control_events ?? [];
+		assert.ok(controlEvents.length > 0);
+		assert.ok(controlEvents.every((event) => event.remaining_seconds === null));
+	}
 });
 
 test("v2 caps parallel tool arrays before executing an extra call", {

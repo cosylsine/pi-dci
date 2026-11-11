@@ -62,7 +62,7 @@ type CandidatePoolPolicy = {
 	context_window: number;
 	max_model_output_tokens: number;
 	max_final_output_tokens: number;
-	sample_timeout_seconds: number;
+	sample_timeout_seconds: number | null;
 	max_search_turns?: number;
 	max_tool_invocations?: number;
 	max_final_repair_turns?: number;
@@ -85,7 +85,7 @@ type CanonicalContract = {
 	top_k: number;
 	max_agent_steps: number;
 	max_final_repair_turns: number;
-	sample_timeout_seconds: number;
+	sample_timeout_seconds: number | null;
 	tool_result_max_bytes: number;
 	max_scratch_bytes: number;
 	max_total_model_tokens: number;
@@ -199,8 +199,10 @@ function resolveDocumentPool(profileName: string, tierReference: string): {
 	const contextWindow = positiveDocumentPoolInt(tier.context_window, `${profile.tier}.context_window`);
 	const maxModelOutput = positiveDocumentPoolInt(tier.max_model_output_tokens, `${profile.tier}.max_model_output_tokens`);
 	const maxFinalOutput = positiveDocumentPoolInt(tier.max_final_output_tokens, `${profile.tier}.max_final_output_tokens`);
-	const timeout = positiveDocumentPoolInt(tier.sample_timeout_seconds, `${profile.tier}.sample_timeout_seconds`);
-	if (contextWindow !== 65536 || maxModelOutput !== 1024 || maxFinalOutput !== 1024 || timeout !== (isV2 ? 300 : 600)) {
+	const timeout = isV2 && tier.sample_timeout_seconds === null
+		? null
+		: positiveDocumentPoolInt(tier.sample_timeout_seconds, `${profile.tier}.sample_timeout_seconds`);
+	if (contextWindow !== 65536 || maxModelOutput !== 1024 || maxFinalOutput !== 1024 || timeout !== (isV2 ? null : 600)) {
 		throw new Error("Document pool limits changed outside the candidate-pool budget contract");
 	}
 	const maxSearchTurns = isV2 ? positiveDocumentPoolInt(tier.max_search_turns, `${profile.tier}.max_search_turns`) : undefined;
@@ -376,7 +378,7 @@ type Args = {
 	model: string;
 	maxAgentSteps: number;
 	contextWindow: number;
-	timeoutSeconds: number;
+	timeoutSeconds: number | null;
 	deadlineAtMs?: number;
 };
 
@@ -548,6 +550,24 @@ function textOf(content: Message["content"] | AssistantMessage["content"]): stri
 		.join("\n");
 }
 
+export function parseTimeoutSeconds(
+	value: string | true | undefined,
+	fallback: number | null,
+	allowUnlimited: boolean,
+): number | null {
+	const timeoutValue = value ?? (fallback === null ? "none" : String(fallback));
+	const timeoutText = typeof timeoutValue === "string" ? timeoutValue.trim().toLowerCase() : "";
+	if (timeoutText === "none" || timeoutText === "null") {
+		if (!allowUnlimited) throw new Error("--timeout-seconds must be positive");
+		return null;
+	}
+	const timeoutSeconds = typeof timeoutValue === "string" ? Number(timeoutValue) : NaN;
+	if (timeoutSeconds !== null && (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)) {
+		throw new Error(`--timeout-seconds must be positive${allowUnlimited ? " or none" : ""}`);
+	}
+	return timeoutSeconds;
+}
+
 function parseArgs(argv: string[]): Args {
 	const values = new Map<string, string | true>();
 	for (let index = 0; index < argv.length; index++) {
@@ -577,9 +597,11 @@ function parseArgs(argv: string[]): Args {
 	};
 	const preflightOnly = values.has("preflight-only");
 	if (EVALUATION_TRACK !== "code" && values.has("code-files")) throw new Error("--code-files requires code evaluation");
-	const timeoutValue = values.get("timeout-seconds") ?? String(DEFAULT_CONTRACT.sample_timeout_seconds);
-	const timeoutSeconds = typeof timeoutValue === "string" ? Number(timeoutValue) : NaN;
-	if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) throw new Error("--timeout-seconds must be positive");
+	const timeoutSeconds = parseTimeoutSeconds(
+		values.get("timeout-seconds"),
+		DEFAULT_CONTRACT.sample_timeout_seconds,
+		DEFAULT_CONTRACT.candidate_pool?.schema_version === "document-pool-v2",
+	);
 	const deadlineValue = values.get("deadline-at-ms");
 	const deadlineAtMs = deadlineValue === undefined ? undefined : typeof deadlineValue === "string" ? Number(deadlineValue) : NaN;
 	if (deadlineAtMs !== undefined && (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= 0)) {
@@ -1709,7 +1731,9 @@ function redactArgv(argv: string[]): string[] {
 
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
-	const deadlineAt = Math.min(PROCESS_STARTED_AT + args.timeoutSeconds * 1000, args.deadlineAtMs ?? Infinity);
+	const deadlineAt = args.timeoutSeconds === null
+		? args.deadlineAtMs
+		: Math.min(PROCESS_STARTED_AT + args.timeoutSeconds * 1000, args.deadlineAtMs ?? Infinity);
 	const codeFiles = args.codeFiles ? parseCodeFiles(JSON.parse(await readFile(resolve(args.codeFiles), "utf8"))) : undefined;
 	const isV2 = DEFAULT_CONTRACT.candidate_pool?.schema_version === "document-pool-v2";
 	const sandboxValidateStarted = isV2 ? monotonicNow() : undefined;
@@ -1806,7 +1830,7 @@ async function main() {
 					return true;
 				}
 				totalModelTokens += currentUsage.value.input + currentUsage.value.output;
-				if (Date.now() >= deadlineAt) {
+				if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
 					structuredFailure = makeFailure("timeout", "sample wall deadline reached before final acceptance");
 					return true;
 				}
@@ -1855,7 +1879,7 @@ async function main() {
 					const hasEvidence = hasBodyEvidence(evidence);
 					const repeating = calls.length > 0 && identicalCalls >= budgetPolicy.repeat_threshold;
 					const lowBudget = remaining <= reserve;
-					const remainingSeconds = Math.max(0, (deadlineAt - Date.now()) / 1000);
+					const remainingSeconds = deadlineAt === undefined ? null : Math.max(0, (deadlineAt - Date.now()) / 1000);
 					if (toolCapReached && !hasEvidence) {
 						structuredFailure = makeFailure("tool_failure", "v2 tool invocation cap reached before a nonempty corpus read receipt");
 						return true;
@@ -1929,8 +1953,10 @@ async function main() {
 		};
 		process.once("SIGTERM", onTerminate);
 		process.once("SIGINT", onTerminate);
-		const remainingMs = deadlineAt - Date.now();
-		deadlineTimer = setTimeout(onTerminate, Math.max(1, remainingMs));
+		if (deadlineAt !== undefined) {
+			const remainingMs = deadlineAt - Date.now();
+			deadlineTimer = setTimeout(onTerminate, Math.max(1, remainingMs));
+		}
 		const persistTrace = () => {
 			if (!trace) return;
 			const messages = agent.state.messages.filter((message): message is Message =>
@@ -1967,7 +1993,7 @@ async function main() {
 			let nextPrompt: string | undefined = prompt;
 			while (nextPrompt && !structuredFailure) {
 				pendingControl = undefined;
-				if (Date.now() >= deadlineAt) {
+				if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
 					structuredFailure = makeFailure("timeout", "sample wall deadline reached before model request");
 					break;
 				}
