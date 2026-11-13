@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { constants as fsConstants, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -16,13 +16,22 @@ import {
 	type Context,
 	type Message,
 	type Model,
-	type SimpleStreamOptions,
-	type Tool,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import { Unsafe } from "typebox";
 import { Value } from "typebox/value";
 import type { TSchema } from "typebox";
+import {
+	availableUsage,
+	createBridgeStreamFn,
+	emptyUsage,
+	parseAdaptedJson,
+	parseUsage,
+	stripModelNoise,
+	unavailableUsage,
+} from "./adapters/inspect-bridge.ts";
+export { createBridgeStreamFn, parseUsage } from "./adapters/inspect-bridge.ts";
+import { parseRuntimeJson, type FrozenRuntimeDescriptor, validateRuntimeDescriptor } from "./dci-runtime.ts";
 
 type CanonicalToolDefinition = {
 	name: string;
@@ -380,6 +389,7 @@ type Args = {
 	contextWindow: number;
 	timeoutSeconds: number | null;
 	deadlineAtMs?: number;
+	runtime?: FrozenRuntimeDescriptor;
 };
 
 type MockStep =
@@ -398,6 +408,8 @@ type MockUsage = {
 	output_tokens?: number;
 	prompt_tokens?: number;
 	completion_tokens?: number;
+	total_tokens?: number;
+	totalTokens?: number;
 };
 
 type UsageSummary = {
@@ -435,56 +447,7 @@ function makeFailure(kind: Exclude<FailureKind, "none">, message: string): Struc
 	return { kind, message };
 }
 
-function usage(input = 0, output = 0, cacheRead = 0, cacheWrite = 0) {
-	return {
-		input,
-		output,
-		cacheRead,
-		cacheWrite,
-		totalTokens: input + output,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-}
-
-function numberOrUndefined(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
-function parseUsage(raw: unknown): { available: boolean; value: ReturnType<typeof usage> } {
-	if (!raw || typeof raw !== "object") return { available: false, value: usage() };
-	const payload = raw as Record<string, unknown>;
-	const input = numberOrUndefined(payload.input ?? payload.prompt_tokens ?? payload.input_tokens);
-	const output = numberOrUndefined(payload.output ?? payload.completion_tokens ?? payload.output_tokens);
-	const promptDetails = payload.prompt_tokens_details;
-	const promptDetailsCacheRead =
-		promptDetails && typeof promptDetails === "object"
-			? (promptDetails as Record<string, unknown>).cached_tokens
-			: undefined;
-	const cacheRead =
-		numberOrUndefined(
-			payload.cacheRead ??
-				payload.cache_read_tokens ??
-				payload.cache_read ??
-				payload.cache_read_input_tokens ??
-				promptDetailsCacheRead,
-		) ?? 0;
-	const cacheWrite =
-		numberOrUndefined(
-			payload.cacheWrite ?? payload.cache_write_tokens ?? payload.cache_write ?? payload.cache_creation_input_tokens,
-		) ?? 0;
-	if (input === undefined || output === undefined) return { available: false, value: usage() };
-	return { available: true, value: usage(input, output, cacheRead, cacheWrite) };
-}
-
-function unavailableUsage(): ReturnType<typeof usage> & { usageAvailable: boolean } {
-	return { ...usage(), usageAvailable: false };
-}
-
-function availableUsage(value: ReturnType<typeof usage>): ReturnType<typeof usage> & { usageAvailable: boolean } {
-	return { ...value, usageAvailable: true };
-}
-
-function readMessageUsage(message: AssistantMessage): { available: boolean; value: ReturnType<typeof usage> } {
+function readMessageUsage(message: AssistantMessage): ReturnType<typeof parseUsage> {
 	const messageWithMarker = message as AssistantMessage & { usageAvailable?: unknown };
 	const usageWithMarker = message.usage as AssistantMessage["usage"] & { usageAvailable?: unknown };
 	if (
@@ -493,7 +456,7 @@ function readMessageUsage(message: AssistantMessage): { available: boolean; valu
 		message.stopReason === "error" ||
 		message.stopReason === "aborted"
 	) {
-		return { available: false, value: usage() };
+		return { available: false, value: emptyUsage() };
 	}
 	const parsed = parseUsage(message.usage);
 	return { available: parsed.available, value: parsed.value };
@@ -595,6 +558,15 @@ function parseArgs(argv: string[]): Args {
 		if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`--${key} must be a positive integer`);
 		return parsed;
 	};
+	const runtimeOptionKeys = [...values.keys()].filter((key) => key === "runtime" || (key.startsWith("runtime-") && key !== "runtime-json"));
+	if (runtimeOptionKeys.length > 0) {
+		throw new Error(`Unsupported runtime option ${runtimeOptionKeys[0]}; use --runtime-json '<JSON>'`);
+	}
+	const runtimeJson = values.get("runtime-json");
+	if (runtimeJson !== undefined && typeof runtimeJson !== "string") throw new Error("--runtime-json requires a JSON value");
+	if (EVALUATION_TRACK === "code" && runtimeJson !== undefined) {
+		throw new Error("Frozen RootFS runtime is supported only for document evaluation; omit --runtime-json for Code Track");
+	}
 	const preflightOnly = values.has("preflight-only");
 	if (EVALUATION_TRACK !== "code" && values.has("code-files")) throw new Error("--code-files requires code evaluation");
 	const timeoutSeconds = parseTimeoutSeconds(
@@ -626,6 +598,7 @@ function parseArgs(argv: string[]): Args {
 		contextWindow: positiveInt("context-window", defaultContextWindow),
 		timeoutSeconds,
 		deadlineAtMs,
+		runtime: runtimeJson === undefined ? undefined : parseRuntimeJson(runtimeJson),
 	};
 }
 
@@ -719,13 +692,14 @@ async function validateTrustedExecutable(path: string, label: string): Promise<s
 	return canonical;
 }
 
-type CorpusSandbox = {
+export type CorpusSandbox = {
 	workspace: string;
 	corpus: string;
 	bwrap: string;
 	rg?: string;
 	rgConfig?: string;
 	codeFiles?: CodeFiles;
+	runtime?: FrozenRuntimeDescriptor;
 };
 
 type CodeFileMetadata = { sha256: string; line_count: number; content_tokens?: number };
@@ -793,7 +767,11 @@ export async function validateCodeCorpus(corpus: string, files: CodeFiles): Prom
 	for (const path of Object.keys(files)) if (!seen.has(path)) throw new Error(`Missing code corpus file: ${path}`);
 }
 
-async function validateCorpusSandbox(workspace: string, codeFiles?: CodeFiles): Promise<CorpusSandbox> {
+async function validateCorpusSandbox(
+	workspace: string,
+	codeFiles?: CodeFiles,
+	runtime?: FrozenRuntimeDescriptor,
+): Promise<CorpusSandbox> {
 	const resolvedWorkspace = await realpath(workspace);
 	const corpus = resolve(resolvedWorkspace, "corpus");
 	const corpusInfo = await lstat(corpus);
@@ -825,7 +803,7 @@ async function validateCorpusSandbox(workspace: string, codeFiles?: CodeFiles): 
 	if (bwrap !== "/usr/bin/bwrap") {
 		throw new Error(`bubblewrap must resolve to the expected system path: ${bwrap}`);
 	}
-	const rgCandidate = DEFAULT_CONTRACT.search_policy ? "/usr/bin/rg" : await findExecutable("rg");
+	const rgCandidate = runtime ? undefined : DEFAULT_CONTRACT.search_policy ? "/usr/bin/rg" : await findExecutable("rg");
 	let rg: string | undefined;
 	if (rgCandidate) {
 		try {
@@ -834,12 +812,13 @@ async function validateCorpusSandbox(workspace: string, codeFiles?: CodeFiles): 
 			// grep remains available from the read-only system mount.
 		}
 	}
-	if (DEFAULT_CONTRACT.search_policy && !rg) throw new Error("stable-rg requires a trusted ripgrep executable");
-	return { workspace: resolvedWorkspace, corpus: await realpath(corpus), bwrap, rg, codeFiles,
+	if (!runtime && DEFAULT_CONTRACT.search_policy && !rg) throw new Error("stable-rg requires a trusted ripgrep executable");
+	return { workspace: resolvedWorkspace, corpus: await realpath(corpus), bwrap, rg, codeFiles, runtime,
 		rgConfig: DEFAULT_CONTRACT.search_policy ? join(dirname(CONTRACT_PATH), "stable-rg.conf") : undefined };
 }
 
-function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): string[] {
+export function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): string[] {
+	const runtime = sandbox.runtime;
 	const args = [
 		"--unshare-user",
 		"--uid",
@@ -856,26 +835,34 @@ function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): 
 		"ALL",
 		"--hostname",
 		"dci-sample",
-		"--dir",
-		"/usr",
-		"--ro-bind",
-		"/usr/bin",
-		"/usr/bin",
-		"--ro-bind",
-		"/usr/lib",
-		"/usr/lib",
-		"--ro-bind",
-		"/usr/lib64",
-		"/usr/lib64",
-		"--symlink",
-		"usr/bin",
-		"/bin",
-		"--symlink",
-		"usr/lib",
-		"/lib",
-		"--symlink",
-		"usr/lib64",
-		"/lib64",
+	];
+	if (runtime) {
+		args.push("--ro-bind", runtime.rootfs_path, "/");
+	} else {
+		args.push(
+			"--dir",
+			"/usr",
+			"--ro-bind",
+			"/usr/bin",
+			"/usr/bin",
+			"--ro-bind",
+			"/usr/lib",
+			"/usr/lib",
+			"--ro-bind",
+			"/usr/lib64",
+			"/usr/lib64",
+			"--symlink",
+			"usr/bin",
+			"/bin",
+			"--symlink",
+			"usr/lib",
+			"/lib",
+			"--symlink",
+			"usr/lib64",
+			"/lib64",
+		);
+	}
+	args.push(
 		"--dev",
 		"/dev",
 		"--dir",
@@ -883,13 +870,21 @@ function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): 
 		"--ro-bind",
 		sandbox.corpus,
 		"/workspace/corpus",
-		"--bind",
-		scratch,
-		"/scratch",
-		"--dir",
-		"/sandbox-bin",
-	];
-	if (sandbox.rg) args.push("--ro-bind", sandbox.rg, "/sandbox-bin/rg");
+	);
+	if (runtime) {
+		args.push(
+			"--dir",
+			"/scratch",
+			"--bind",
+			scratch,
+			"/scratch",
+		);
+		if (!existsSync(join(runtime.rootfs_path, "tmp"))) args.push("--dir", "/tmp");
+		args.push("--bind", join(scratch, "tmp"), "/tmp", "--dir", "/sandbox-bin");
+	} else {
+		args.push("--bind", scratch, "/scratch", "--dir", "/sandbox-bin");
+	}
+	if (!runtime && sandbox.rg) args.push("--ro-bind", sandbox.rg, "/sandbox-bin/rg");
 	if (sandbox.rgConfig) args.push("--ro-bind", sandbox.rgConfig, "/sandbox-bin/rg.conf",
 		"--setenv", "RIPGREP_CONFIG_PATH", "/sandbox-bin/rg.conf");
 	args.push(
@@ -897,7 +892,7 @@ function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): 
 		"/workspace",
 		"--setenv",
 		"PATH",
-		"/sandbox-bin:/usr/bin:/bin",
+		runtime ? "/usr/bin:/bin" : "/sandbox-bin:/usr/bin:/bin",
 		"--setenv",
 		"HOME",
 		"/scratch",
@@ -912,7 +907,12 @@ function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): 
 		"/scratch",
 		"--setenv",
 		"TMPDIR",
-		"/scratch/tmp",
+		runtime ? "/tmp" : "/scratch/tmp",
+		...(runtime ? [
+			"--setenv", "LANG", "C.UTF-8",
+			"--setenv", "LC_ALL", "C.UTF-8",
+			"--setenv", "TZ", "UTC",
+		] : []),
 		"/bin/bash",
 		"--noprofile",
 		"--norc",
@@ -924,13 +924,33 @@ function sandboxArgs(sandbox: CorpusSandbox, scratch: string, command: string): 
 	return args;
 }
 
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
 async function runSandboxPreflight(sandbox: CorpusSandbox): Promise<void> {
 	const scratch = await mkdtemp(join(tmpdir(), "dci-bench-preflight-"));
+	const hostSentinelDirectory = sandbox.runtime ? await mkdtemp(join(tmpdir(), "dci-bench-host-sentinel-")) : undefined;
+	const hostSentinel = hostSentinelDirectory ? join(hostSentinelDirectory, "host-only") : undefined;
 	try {
 		await mkdir(join(scratch, "tmp"), { mode: 0o700 });
-		const command =
-			"test -r /workspace/corpus && test ! -e /mnt && test ! -e /root && test ! -e /proc && test ! -e /tmp && test -w /scratch && test -w \"$TMPDIR\"" +
-			(sandbox.rgConfig ? " && test -r \"$RIPGREP_CONFIG_PATH\" && test ! -w \"$RIPGREP_CONFIG_PATH\" && rg --files /workspace/corpus >/dev/null" : "");
+		if (hostSentinel) writeFileSync(hostSentinel, "host-only\n", { encoding: "utf8", mode: 0o600 });
+		const command = sandbox.runtime
+			? [
+				"test -r /workspace/corpus",
+				"test -x /bin/bash && test -x /usr/bin/rg",
+				"test -w /scratch && test -w /tmp && test \"$TMPDIR\" = /tmp",
+				"touch /scratch/.dci-preflight-scratch && rm /scratch/.dci-preflight-scratch",
+				"touch /tmp/.dci-preflight-tmp && test -e /scratch/tmp/.dci-preflight-tmp && rm /tmp/.dci-preflight-tmp",
+				"touch /scratch/tmp/.dci-preflight-tmp2 && test -e /tmp/.dci-preflight-tmp2 && rm /scratch/tmp/.dci-preflight-tmp2",
+				"if touch /workspace/corpus/.dci-preflight-write; then rm -f /workspace/corpus/.dci-preflight-write; exit 1; fi",
+				"if touch /usr/bin/.dci-preflight-write; then rm -f /usr/bin/.dci-preflight-write; exit 1; fi",
+				"test ! -e /proc/1/cmdline",
+				...(hostSentinel ? [`test ! -e ${shellQuote(hostSentinel)}`] : []),
+				...(sandbox.rgConfig ? ["test -r \"$RIPGREP_CONFIG_PATH\"", "test ! -w \"$RIPGREP_CONFIG_PATH\"", "rg --files /workspace/corpus >/dev/null"] : []),
+			].join(" && ")
+			: "test -r /workspace/corpus && test ! -e /mnt && test ! -e /root && test ! -e /proc && test ! -e /tmp && test -w /scratch && test -w \"$TMPDIR\"" +
+				(sandbox.rgConfig ? " && test -r \"$RIPGREP_CONFIG_PATH\" && test ! -w \"$RIPGREP_CONFIG_PATH\" && rg --files /workspace/corpus >/dev/null" : "");
 		const result = await new Promise<{ code: number; stderr: string }>((resolvePromise, reject) => {
 			const proc = spawn(sandbox.bwrap, sandboxArgs(sandbox, scratch, command), {
 				env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
@@ -946,6 +966,7 @@ async function runSandboxPreflight(sandbox: CorpusSandbox): Promise<void> {
 		}
 	} finally {
 		await rm(scratch, { recursive: true, force: true });
+		if (hostSentinelDirectory) await rm(hostSentinelDirectory, { recursive: true, force: true });
 	}
 }
 
@@ -994,43 +1015,6 @@ function workspaceRelativePath(workspace: string, path: string): string {
 
 function hasBodyEvidence(evidence: EvidenceState): boolean {
 	return evidence.readReceipts.length > 0;
-}
-
-function stripModelNoise(text: string): string {
-	return text
-		.trim()
-		.replace(/^(?:(?:<think>[\s\S]*?<\/think>|<<content-internal>[\s\S]*?<\/content-internal>>)\s*)+/, "")
-		.trim();
-}
-
-function parseAdaptedJson(text: string): unknown {
-	try {
-		return JSON.parse(text);
-	} catch {
-		// Only adapt text outside JSON. Literal thinking tags inside an ID or
-		// shell argument belong to the model's payload and must remain intact.
-		return JSON.parse(stripModelNoise(text));
-	}
-}
-
-function parsePseudoToolCall(text: string): ToolCall | undefined {
-	try {
-		const value = parseAdaptedJson(text);
-		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-		const parsed = value as Record<string, unknown>;
-		if (
-			parsed &&
-			typeof parsed === "object" &&
-			(parsed.name === "read" || parsed.name === "bash") &&
-			parsed.arguments &&
-			typeof parsed.arguments === "object"
-		) {
-			return fauxToolCall(parsed.name, parsed.arguments);
-		}
-	} catch {
-		return undefined;
-	}
-	return undefined;
 }
 
 async function resolveCorpusPath(sandbox: CorpusSandbox, requested: string): Promise<string> {
@@ -1448,7 +1432,7 @@ function estimateNextInputTokens(context: Context, conservative = false, bytesPe
 		const current = readMessageUsage(message);
 		if (!current.available) continue;
 		lastUsageIndex = index;
-		estimated = current.value.input + current.value.output;
+		estimated = current.value.totalTokens;
 		break;
 	}
 	const trailingMessages = context.messages.slice(lastUsageIndex + 1);
@@ -1538,161 +1522,6 @@ async function createMockStreamFn(mockScript: string): Promise<StreamFn> {
 	};
 }
 
-function toOpenAIMessages(context: Context): Record<string, unknown>[] {
-	const messages: Record<string, unknown>[] = [];
-	if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
-	for (const message of context.messages) {
-		if (message.role === "user") {
-			messages.push({ role: "user", content: textOf(message.content) });
-		} else if (message.role === "assistant") {
-			const text = textOf(message.content).replace(/\[toolCall:[^\]]+\]/g, "").trim();
-			const toolCalls = message.content
-				.filter((part): part is ToolCall => part.type === "toolCall")
-				.map((part) => ({
-					id: part.id,
-					type: "function",
-					function: { name: part.name, arguments: JSON.stringify(part.arguments ?? {}) },
-				}));
-			messages.push({
-				role: "assistant",
-				content: text || null,
-				...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-			});
-		} else if (message.role === "toolResult") {
-			messages.push({
-				role: "tool",
-				tool_call_id: message.toolCallId,
-				name: message.toolName,
-				content: textOf(message.content),
-			});
-		}
-	}
-	return messages;
-}
-
-function toOpenAITools(tools: readonly Tool[] | undefined): Record<string, unknown>[] {
-	return (tools ?? []).map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters,
-		},
-	}));
-}
-
-export function createBridgeStreamFn(args: Args): StreamFn {
-	return async (model, context, options?: SimpleStreamOptions) => {
-		const stream = createAssistantMessageEventStream();
-		queueMicrotask(async () => {
-			try {
-				const baseUrl = args.openaiBaseUrl.replace(/\/+$/, "");
-				const estimatedInputTokens = estimateNextInputTokens(context);
-				if (
-					estimatedInputTokens + DEFAULT_CONTRACT.max_model_output_tokens + CONTEXT_SAFETY_TOKENS >
-					model.contextWindow
-				) {
-					throw new Error(
-						`DCI_CONTEXT_WINDOW_PREFLIGHT: estimated input ${estimatedInputTokens} plus ` +
-							`${DEFAULT_CONTRACT.max_model_output_tokens} output and ${CONTEXT_SAFETY_TOKENS} safety tokens ` +
-							`exceeds model context window ${model.contextWindow}`,
-					);
-				}
-				const readOnly = context.tools?.length === 1 && context.tools[0].name === "read";
-				const request = {
-					model: args.model,
-					messages: toOpenAIMessages(context),
-					tools: toOpenAITools(context.tools),
-					tool_choice: options?.toolChoice === "none" ? "none" : readOnly ? { type: "function", function: { name: "read" } } : "auto",
-					max_tokens: DEFAULT_CONTRACT.max_model_output_tokens,
-					temperature: DEFAULT_CONTRACT.generation_config.temperature,
-					seed: DEFAULT_CONTRACT.generation_config.seed,
-					chat_template_kwargs: { enable_thinking: DEFAULT_CONTRACT.generation_config.enable_thinking },
-				};
-				const response = await fetch(`${baseUrl}/chat/completions`, {
-					method: "POST",
-					headers: {
-						"content-type": "application/json",
-						authorization: `Bearer ${args.openaiApiKey}`,
-					},
-					body: JSON.stringify(request),
-					signal: options?.signal,
-				});
-				const payload = await response.json() as {
-					usage?: unknown;
-					choices?: Array<{ finish_reason?: string; message?: {
-						content?: unknown;
-						tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
-					} }>;
-				};
-				if (!response.ok) throw new Error(JSON.stringify(payload));
-				const choice = payload.choices?.[0];
-				const output = choice?.message ?? {};
-				const content: AssistantMessage["content"] = [];
-				if (typeof output.content === "string" && output.content) {
-					content.push({ type: "text", text: output.content });
-				}
-				const toolsDisabled = options?.toolChoice === "none";
-				// A backend that ignores tool_choice must not execute a late tool call.
-				// Preserve the response and its usage as an invalid final for repair.
-				if (toolsDisabled && output.tool_calls?.length) {
-					content.splice(0, content.length, { type: "text", text: JSON.stringify({ blocked_tool_calls: output.tool_calls }) });
-				}
-				for (const toolCall of toolsDisabled ? [] : output.tool_calls ?? []) {
-					if (!toolCall.function?.name) throw new Error("backend returned a tool call without a name");
-					const rawArgs = toolCall.function?.arguments ?? "{}";
-					let parsedArgs: Record<string, unknown> = {};
-					try {
-						parsedArgs = JSON.parse(rawArgs);
-					} catch {
-						parsedArgs = { raw_arguments: rawArgs };
-					}
-					content.push({
-						type: "toolCall",
-						id: toolCall.id ?? `tool_${createHash("sha1").update(JSON.stringify(toolCall)).digest("hex").slice(0, 12)}`,
-						name: toolCall.function?.name,
-						arguments: parsedArgs,
-					});
-				}
-				const pseudoToolCall = !toolsDisabled && content.length === 1 && content[0]?.type === "text" ? parsePseudoToolCall(content[0].text) : undefined;
-				if (pseudoToolCall) {
-					content.splice(0, content.length, pseudoToolCall);
-				}
-				const stopReason = choice?.finish_reason === "length" ? "length" : content.some((part) => part.type === "toolCall") ? "toolUse" : "stop";
-				const responseUsage = parseUsage(payload.usage);
-				const message: AssistantMessage = {
-					role: "assistant",
-					content,
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-					usage: responseUsage.available ? availableUsage(responseUsage.value) : unavailableUsage(),
-					stopReason,
-					rawStopReason: choice?.finish_reason,
-					timestamp: Date.now(),
-				};
-				stream.push({ type: "done", reason: stopReason, message });
-				stream.end(message);
-			} catch (error) {
-				const message: AssistantMessage = {
-					role: "assistant",
-					content: [{ type: "text", text: "" }],
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-					usage: unavailableUsage(),
-					stopReason: "error",
-					errorMessage: error instanceof Error ? error.message : String(error),
-					timestamp: Date.now(),
-				};
-				stream.push({ type: "error", reason: "error", error: message });
-				stream.end(message);
-			}
-		});
-		return stream;
-	};
-}
-
 function buildPrompt(query: string, taskInstruction: string): string {
 	const instruction = taskInstruction.trim();
 	const instructionBlock = instruction
@@ -1731,13 +1560,14 @@ function redactArgv(argv: string[]): string[] {
 
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
+	const runtime = args.runtime ? validateRuntimeDescriptor(args.runtime) : undefined;
 	const deadlineAt = args.timeoutSeconds === null
 		? args.deadlineAtMs
 		: Math.min(PROCESS_STARTED_AT + args.timeoutSeconds * 1000, args.deadlineAtMs ?? Infinity);
 	const codeFiles = args.codeFiles ? parseCodeFiles(JSON.parse(await readFile(resolve(args.codeFiles), "utf8"))) : undefined;
 	const isV2 = DEFAULT_CONTRACT.candidate_pool?.schema_version === "document-pool-v2";
 	const sandboxValidateStarted = isV2 ? monotonicNow() : undefined;
-	const sandbox = await validateCorpusSandbox(resolve(args.workspace), codeFiles);
+	const sandbox = await validateCorpusSandbox(resolve(args.workspace), codeFiles, runtime);
 	const sandboxValidateSeconds = sandboxValidateStarted === undefined ? 0 : elapsedSeconds(sandboxValidateStarted);
 	if (codeFiles) {
 		for (const metadataPath of [args.codeFiles!, codeContractPath!]) {
@@ -1796,7 +1626,28 @@ async function main() {
 		let toolInvocations = 0;
 		const model = createModel(args.modelProvider, args.model, args.openaiBaseUrl, args.contextWindow);
 		const baseStreamFn =
-			args.modelProvider === "mock" ? await createMockStreamFn(args.mockScript!) : createBridgeStreamFn(args);
+			args.modelProvider === "mock" ? await createMockStreamFn(args.mockScript!) : createBridgeStreamFn({
+				baseUrl: args.openaiBaseUrl,
+				apiKey: args.openaiApiKey,
+				model: args.model,
+				maxTokens: DEFAULT_CONTRACT.max_model_output_tokens,
+				temperature: DEFAULT_CONTRACT.generation_config.temperature,
+				seed: DEFAULT_CONTRACT.generation_config.seed,
+				enableThinking: DEFAULT_CONTRACT.generation_config.enable_thinking,
+				contextPreflight: (currentModel, context) => {
+					const estimatedInputTokens = estimateNextInputTokens(context);
+					if (
+						estimatedInputTokens + DEFAULT_CONTRACT.max_model_output_tokens + CONTEXT_SAFETY_TOKENS >
+						currentModel.contextWindow
+					) {
+						throw new Error(
+							`DCI_CONTEXT_WINDOW_PREFLIGHT: estimated input ${estimatedInputTokens} plus ` +
+								`${DEFAULT_CONTRACT.max_model_output_tokens} output and ${CONTEXT_SAFETY_TOKENS} safety tokens ` +
+								`exceeds model context window ${currentModel.contextWindow}`,
+						);
+					}
+				},
+			});
 		const readTool = codeFiles ? createCodeReadTool(sandbox, evidence) : createReadTool(sandbox, evidence);
 		const searchTools = [readTool, createBashTool(sandbox, scratch, evidence, bashTiming)];
 		const agent = new Agent({
@@ -1829,7 +1680,7 @@ async function main() {
 					);
 					return true;
 				}
-				totalModelTokens += currentUsage.value.input + currentUsage.value.output;
+				totalModelTokens += currentUsage.value.totalTokens;
 				if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
 					structuredFailure = makeFailure("timeout", "sample wall deadline reached before final acceptance");
 					return true;
@@ -1970,6 +1821,7 @@ async function main() {
 				protocol_profile: PROTOCOL_PROFILE, base_contract_sha256: CONTRACT_SHA256, control_events: controlEvents,
 				started_at: startedAt, updated_at: new Date().toISOString(), partial: true,
 				inspect_sandbox: "local", tool_sandbox: "bubblewrap",
+				...(runtime ? { agent_runtime: runtime.identity } : {}),
 				task_instruction: taskInstruction, failure: structuredFailure,
 				usage_summary: usageSummary(messages, observedTokens), usage_by_turn: usageByTurn(messages),
 				events, messages, body_evidence: { read_receipts: evidence.readReceipts },
@@ -2032,6 +1884,9 @@ async function main() {
 		let finalText = finalAnswerFrom(agent.state.messages);
 		let parsed = parseRuntimeFinal(finalText, sandbox);
 		let finalIssue = runtimeFinalIssue(parsed, evidence, corpusIds);
+		// V2 repair of a submitted answer must not reopen retrieval merely
+		// because its JSON failed to parse. ID repairs already finalize above.
+		if (isV2 && hasBodyEvidence(evidence)) finalizing = true;
 		while (
 			!structuredFailure &&
 			finalIssue &&
@@ -2101,6 +1956,7 @@ async function main() {
 			model: model.id,
 			inspect_sandbox: "local",
 			tool_sandbox: "bubblewrap",
+			...(runtime ? { agent_runtime: runtime.identity } : {}),
 			contract: {
 				benchmark_contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
 				task_instruction: taskInstruction,
@@ -2139,6 +1995,7 @@ async function main() {
 					output,
 					inspect_sandbox: "local",
 					tool_sandbox: "bubblewrap",
+					...(runtime ? { agent_runtime: runtime.identity } : {}),
 					contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
 					protocol_profile: PROTOCOL_PROFILE,
 					base_contract_sha256: CONTRACT_SHA256,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, link, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -9,12 +9,21 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { fauxAssistantMessage, type Context, type Model } from "@earendil-works/pi-ai";
-import { corpusDocumentIds, createBridgeStreamFn, createReadTool, documentIdIssue, estimateBudgetReserve, parseFinalJson, parseTimeoutSeconds, truncate, utf8Prefix } from "./dci-run.ts";
+import { corpusDocumentIds, createBridgeStreamFn, createReadTool, documentIdIssue, estimateBudgetReserve, parseFinalJson, parseTimeoutSeconds, parseUsage, sandboxArgs, truncate, utf8Prefix, type CorpusSandbox } from "./dci-run.ts";
+import { parseAdaptedJson, parsePseudoToolCall, stripModelNoise } from "./adapters/inspect-bridge.ts";
+import { parseRuntimeJson, validateRuntimeDescriptor, type FrozenRuntimeDescriptor } from "./dci-runtime.ts";
 
 const PI_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DCI_RUN = join(dirname(fileURLToPath(import.meta.url)), "dci-run.ts");
 
-type MockUsage = { input?: number; output?: number };
+type MockUsage = {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	total_tokens?: number;
+	totalTokens?: number;
+};
 type MockStep =
 	| { type: "tool_call"; name: string; arguments: Record<string, unknown>; id?: string; usage?: MockUsage }
 	| { type: "tool_calls"; calls: Array<{ name: string; arguments: Record<string, unknown>; id?: string }>; usage?: MockUsage }
@@ -31,11 +40,81 @@ type ControlEvent = { remaining_seconds?: unknown };
 type RunnerResult = Record<string, unknown> & {
 	failure?: { kind?: string } | null;
 	contract?: { sample_timeout_seconds?: unknown };
+	usage_summary?: {
+		input_tokens?: unknown;
+		output_tokens?: unknown;
+		cache_read_tokens?: unknown;
+		cache_write_tokens?: unknown;
+		total_tokens?: unknown;
+		total_model_tokens?: unknown;
+	};
 	stage_timing?: StageTiming;
-	trace?: { events?: TraceEvent[]; stage_timing?: StageTiming; control_events?: ControlEvent[] };
+	body_evidence?: { read_receipts?: unknown[] };
+	agent_runtime?: Record<string, unknown>;
+	trace?: {
+		events?: TraceEvent[];
+		stage_timing?: StageTiming;
+		control_events?: ControlEvent[];
+		usage_by_turn?: Array<Record<string, unknown>>;
+		agent_runtime?: Record<string, unknown>;
+	};
 };
 
-async function runV2Mock(steps: MockStep[], tokenBudget?: string, timeoutSeconds: string | null = "30"): Promise<RunnerResult> {
+type FrozenRuntimeFixture = {
+	root: string;
+	rootfs: string;
+	ready: string;
+	descriptor: FrozenRuntimeDescriptor;
+};
+
+async function createFrozenRuntimeFixture(): Promise<FrozenRuntimeFixture> {
+	const root = await mkdtemp(join(tmpdir(), "dci-frozen-runtime-test-"));
+	const rootfs = join(root, "rootfs");
+	const ready = join(root, "READY.json");
+	await mkdir(join(rootfs, "usr/bin"), { recursive: true });
+	for (const tool of ["bash", "rg"]) {
+		const destination = join(rootfs, "usr/bin", tool);
+		await cp(`/usr/bin/${tool}`, destination);
+		await chmod(destination, 0o555);
+	}
+	await chmod(rootfs, 0o555);
+	const hash = async (path: string) => createHash("sha256").update(await readFile(path)).digest("hex");
+	const identity = {
+		schema_version: "dci-agent-runtime-v1",
+		mode: "frozen-rootfs",
+		image_digest: `sha256:${"1".repeat(64)}`,
+		platform: "linux/amd64",
+		rootfs_tree_sha256: "2".repeat(64),
+		tool_policy: "open",
+		filesystem_policy: "dci-bwrap-frozen-ro-v1",
+		runtime_policy_sha256: "3".repeat(64),
+	} as const;
+	await writeFile(ready, JSON.stringify({
+		schema_version: "dci-rootfs-ready-v1",
+		content_identity: {
+			image_digest: identity.image_digest,
+			platform: identity.platform,
+			rootfs_tree_sha256: identity.rootfs_tree_sha256,
+		},
+		tools: {
+			bash: { path: "usr/bin/bash", sha256: await hash(join(rootfs, "usr/bin/bash")), version: "fixture-bash" },
+			rg: { path: "usr/bin/rg", sha256: await hash(join(rootfs, "usr/bin/rg")), version: "fixture-rg" },
+		},
+	}), { mode: 0o444 });
+	return {
+		root,
+		rootfs,
+		ready,
+		descriptor: parseRuntimeJson(JSON.stringify({ identity, rootfs_path: rootfs })),
+	};
+}
+
+async function runV2Mock(
+	steps: MockStep[],
+	tokenBudget?: string,
+	timeoutSeconds: string | null = "30",
+	runtime?: FrozenRuntimeDescriptor,
+): Promise<RunnerResult> {
 	const root = await mkdtemp(join(tmpdir(), "dci-v2-transcript-"));
 	try {
 		const workspace = join(root, "workspace");
@@ -52,9 +131,10 @@ async function runV2Mock(steps: MockStep[], tokenBudget?: string, timeoutSeconds
 		if (tokenBudget === undefined) delete environment.DCI_DOCUMENT_TOKEN_BUDGET;
 		else environment.DCI_DOCUMENT_TOKEN_BUDGET = tokenBudget;
 		const timeoutArgs = timeoutSeconds === null ? [] : ["--timeout-seconds", timeoutSeconds];
+		const runtimeArgs = runtime ? ["--runtime-json", JSON.stringify(runtime)] : [];
 		const child = spawn(process.execPath, ["--import", "tsx", DCI_RUN,
 			"--query-file", query, "--workspace", workspace, "--output", output,
-			"--trace", trace, "--mock-script", mock, "--model", "mock", ...timeoutArgs],
+			"--trace", trace, "--mock-script", mock, "--model", "mock", ...runtimeArgs, ...timeoutArgs],
 			{ cwd: PI_ROOT, env: environment, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
@@ -64,9 +144,10 @@ async function runV2Mock(steps: MockStep[], tokenBudget?: string, timeoutSeconds
 			child.on("error", reject);
 			child.on("close", (status) => resolve(status ?? -1));
 		});
+		assert.ok(code === 0 || code === 2, `unexpected runner exit ${code}: ${stderr || stdout}`);
+		assert.ok(existsSync(output), `runner produced no result (${code}): ${stderr || stdout}`);
 		const result = JSON.parse(await readFile(output, "utf8")) as RunnerResult;
 		result.trace = JSON.parse(await readFile(trace, "utf8")) as RunnerResult["trace"];
-		assert.ok(code === 0 || code === 2, `unexpected runner exit ${code}: ${stderr || stdout}`);
 		return result;
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -107,6 +188,30 @@ test("timeout parser accepts unlimited aliases and preserves positive limits", (
 	assert.throws(() => parseTimeoutSeconds("none", 600, false), /must be positive$/);
 	assert.throws(() => parseTimeoutSeconds(true, 600, true), /positive or none/);
 	assert.throws(() => parseTimeoutSeconds("0", 600, true), /positive or none/);
+});
+
+test("usage normalization keeps explicit logical totals and rejects invalid totals", () => {
+	const cached = parseUsage({
+		prompt_tokens: 200,
+		completion_tokens: 100,
+		total_tokens: 1100,
+		prompt_tokens_details: { cached_tokens: 800 },
+	});
+	assert.equal(cached.available, true);
+	assert.equal(cached.value.input + cached.value.output, cached.value.totalTokens);
+	assert.deepEqual(cached.value, {
+		input: 1000,
+		output: 100,
+		cacheRead: 800,
+		cacheWrite: 0,
+		totalTokens: 1100,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	});
+	assert.equal(parseUsage({ prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }).value.totalTokens, 12);
+	assert.equal(parseUsage({ prompt_tokens: 10, completion_tokens: 2 }).value.totalTokens, 12);
+	for (const total_tokens of [null, "1100", -1, 11, 1.5, Number.NaN]) {
+		assert.equal(parseUsage({ prompt_tokens: 10, completion_tokens: 2, total_tokens }).available, false);
+	}
 });
 
 test("read accepts exact corpus filenames without decoding or opening paths outside corpus", async () => {
@@ -151,6 +256,17 @@ test("final parsing preserves exact original IDs, including percent signs and su
 	assert.equal(parseFinalJson('{"ranked_doc_ids":["x"],"extra":1}'), undefined);
 	assert.equal(parseFinalJson('{"top_documents":["report.md"]}')?.adapter, "top_documents_to_ranked_doc_ids");
 	assert.deepEqual(parseFinalJson('<think>reasoning</think>{"ranked_doc_ids":["<think>literal</think>"]}')?.ranked_doc_ids, ["<think>literal</think>"]);
+});
+
+test("inspect bridge adapter strips only outer model noise and recognizes pseudo tool calls", () => {
+	const source = '<think>reasoning</think>\n{"ranked_doc_ids":["<think>literal</think>"]}';
+	assert.equal(stripModelNoise(source), '{"ranked_doc_ids":["<think>literal</think>"]}');
+	assert.deepEqual(parseAdaptedJson(source), { ranked_doc_ids: ["<think>literal</think>"] });
+	const call = parsePseudoToolCall('<think>reasoning</think>{"name":"read","arguments":{"path":"doc.md"}}');
+	assert.equal(call?.type, "toolCall");
+	assert.equal(call?.name, "read");
+	assert.deepEqual(call?.arguments, { path: "doc.md" });
+	assert.equal(parsePseudoToolCall('{"name":"write","arguments":{}}'), undefined);
 });
 
 test("UTF-8 output cap counts bytes and never slices a code point", () => {
@@ -226,7 +342,10 @@ test("bridge sends canonical generation parameters, preserves length stop, and c
 			maxAgentSteps: 10, contextWindow: 65536, timeoutSeconds: 10,
 		};
 		const model: Model<"openai-completions"> = { id: "mock", name: "mock", baseUrl: args.openaiBaseUrl, provider: "mock", api: "openai-completions", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 65536, maxTokens: 1024 };
-		const streamFn = createBridgeStreamFn(args);
+		const streamFn = createBridgeStreamFn({
+			baseUrl: args.openaiBaseUrl, apiKey: args.openaiApiKey, model: args.model,
+			maxTokens: 1024, temperature: 0, seed: 0, enableThinking: false,
+		});
 		const stream = await streamFn(model, { messages: [] }, { signal: AbortSignal.timeout(5000) });
 		assert.equal((await stream.result()).stopReason, "length");
 		assert.equal(requests[0].max_tokens, 1024);
@@ -241,6 +360,221 @@ test("bridge sends canonical generation parameters, preserves length stop, and c
 		server.closeAllConnections();
 		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 	}
+});
+
+test("bridge adapter blocks disabled tools and normalizes pseudo tool responses", async () => {
+	const responses = [
+		{
+			choices: [{ message: {
+				content: "ignored",
+				tool_calls: [{ id: "late", function: { name: "read", arguments: '{"path":"doc.md"}' } }],
+			}, finish_reason: "length" }],
+			usage: { prompt_tokens: 10, completion_tokens: 2 },
+		},
+		{
+			choices: [{ message: { content: '<think>reasoning</think>{"name":"read","arguments":{"path":"doc.md"}}' }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 10, completion_tokens: 2 },
+		},
+	];
+	let responseIndex = 0;
+	const server = createServer(async (_request, response) => {
+		response.setHeader("content-type", "application/json");
+		response.end(JSON.stringify(responses[responseIndex++]));
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	try {
+		const address = server.address();
+		assert.ok(address && typeof address !== "string");
+		const config = {
+			baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "test", model: "mock",
+			maxTokens: 1024, temperature: 0, seed: 0, enableThinking: false,
+		};
+		const model: Model<"openai-completions"> = {
+			id: "mock", name: "mock", baseUrl: config.baseUrl, provider: "mock", api: "openai-completions",
+			reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 65536, maxTokens: 1024,
+		};
+		const disabled = await createBridgeStreamFn(config)(model, { messages: [] }, { toolChoice: "none" });
+		const disabledMessage = await disabled.result();
+		assert.equal(disabledMessage.stopReason, "length");
+		assert.equal(disabledMessage.content.find((part) => part.type === "toolCall"), undefined);
+		assert.match(disabledMessage.content[0]?.type === "text" ? disabledMessage.content[0].text : "", /blocked_tool_calls/);
+
+		const pseudo = await createBridgeStreamFn(config)(model, { messages: [] });
+		const pseudoMessage = await pseudo.result();
+		assert.equal(pseudoMessage.stopReason, "toolUse");
+		const pseudoTool = pseudoMessage.content.find((part) => part.type === "toolCall");
+		assert.equal(pseudoTool?.type, "toolCall");
+		if (pseudoTool?.type === "toolCall") assert.deepEqual(pseudoTool.arguments, { path: "doc.md" });
+	} finally {
+		server.closeAllConnections();
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	}
+});
+
+test("bridge preserves Inspect cached prompt totals in the assistant usage", async () => {
+	const server = createServer(async (_request, response) => {
+		response.setHeader("content-type", "application/json");
+		response.end(JSON.stringify({
+			choices: [{ message: { content: "cached response" }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 200, completion_tokens: 100, total_tokens: 1100, prompt_tokens_details: { cached_tokens: 800 } },
+		}));
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	try {
+		const address = server.address();
+		assert.ok(address && typeof address !== "string");
+		const args = {
+			preflightOnly: false, queryFile: "", workspace: "", output: "", modelProvider: "bridge" as const,
+			openaiBaseUrl: `http://127.0.0.1:${address.port}/v1`, openaiApiKey: "test", model: "mock",
+			maxAgentSteps: 10, contextWindow: 65536, timeoutSeconds: 10,
+		};
+		const model: Model<"openai-completions"> = {
+			id: "mock", name: "mock", baseUrl: args.openaiBaseUrl, provider: "mock", api: "openai-completions",
+			reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 65536, maxTokens: 1024,
+		};
+		const stream = await createBridgeStreamFn({
+			baseUrl: args.openaiBaseUrl, apiKey: args.openaiApiKey, model: args.model,
+			maxTokens: 1024, temperature: 0, seed: 0, enableThinking: false,
+		})(
+			model,
+			{ messages: [] },
+			{ signal: AbortSignal.timeout(5000) },
+		);
+		const message = await stream.result();
+		assert.equal(message.usage.input, 1000);
+		assert.equal(message.usage.output, 100);
+		assert.equal(message.usage.cacheRead, 800);
+		assert.equal(message.usage.totalTokens, 1100);
+	} finally {
+		server.closeAllConnections();
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	}
+});
+
+test("explicit totals drive context estimates and cumulative cross-turn budget", async () => {
+	const cached = fauxAssistantMessage("cached response");
+	cached.usage = {
+		...cached.usage,
+		input: 1000,
+		output: 100,
+		cacheRead: 800,
+		totalTokens: 1100,
+	};
+	assert.equal(estimateBudgetReserve({ messages: [cached] }, { reserve_tokens: 0 }).nextInput, 1100);
+
+	const result = await runV2Mock([
+		{
+			type: "tool_call",
+			name: "read",
+			arguments: { path: "doc.md" },
+			usage: { input: 100, output: 1, cacheRead: 11899, total_tokens: 12000 },
+		},
+		{
+			type: "final",
+			text: JSON.stringify({ ranked_doc_ids: ["doc"] }),
+			usage: { input: 100, output: 1, cacheRead: 19899, total_tokens: 20000 },
+		},
+	], "32000");
+	assert.equal(result.valid_output, false);
+	assert.equal(result.failure?.kind, "token_limit");
+	assert.equal(result.usage_summary?.input_tokens, 31998);
+	assert.equal(result.usage_summary?.output_tokens, 2);
+	assert.equal(result.usage_summary?.total_tokens, 32000);
+	assert.equal(result.usage_summary?.total_model_tokens, 32000);
+	assert.deepEqual(result.trace?.usage_by_turn?.map((turn) => turn.total_tokens), [12000, 20000]);
+});
+
+test("frozen runtime validates the descriptor, READY identity, and tool hashes", {
+	skip: !existsSync("/usr/bin/bash") || !existsSync("/usr/bin/rg"),
+}, async () => {
+	const fixture = await createFrozenRuntimeFixture();
+	try {
+		const validated = validateRuntimeDescriptor(fixture.descriptor);
+		assert.equal(validated.rootfs_path, await realpath(fixture.rootfs));
+		const ready = JSON.parse(await readFile(fixture.ready, "utf8")) as Record<string, unknown>;
+		const readyIdentity = ready.content_identity as Record<string, unknown>;
+		await chmod(fixture.rootfs, 0o755);
+		assert.throws(() => validateRuntimeDescriptor(fixture.descriptor), /must be read-only/);
+		await chmod(fixture.rootfs, 0o555);
+		await chmod(fixture.ready, 0o644);
+		assert.throws(() => validateRuntimeDescriptor(fixture.descriptor), /READY.json must be read-only/);
+		await chmod(fixture.ready, 0o444);
+		readyIdentity.rootfs_tree_sha256 = "4".repeat(64);
+		await writeFile(fixture.ready, JSON.stringify(ready));
+		assert.throws(() => validateRuntimeDescriptor(fixture.descriptor), /content_identity does not match/);
+		readyIdentity.rootfs_tree_sha256 = fixture.descriptor.identity.rootfs_tree_sha256;
+		await writeFile(fixture.ready, JSON.stringify(ready));
+		await writeFile(join(fixture.rootfs, "usr/bin/rg"), Buffer.concat([
+			await readFile(join(fixture.rootfs, "usr/bin/rg")), Buffer.from("\0"),
+		]));
+		assert.throws(() => validateRuntimeDescriptor(fixture.descriptor), /hash does not match/);
+	} finally {
+		await rm(fixture.root, { recursive: true, force: true });
+	}
+});
+
+test("frozen runtime rejects malformed identity and non-absolute rootfs paths", () => {
+	const identity = {
+		schema_version: "dci-agent-runtime-v1",
+		mode: "host-tools",
+		image_digest: `sha256:${"1".repeat(64)}`,
+		platform: "linux/amd64",
+		rootfs_tree_sha256: "2".repeat(64),
+		tool_policy: "open",
+		filesystem_policy: "dci-bwrap-frozen-ro-v1",
+		runtime_policy_sha256: "3".repeat(64),
+	};
+	assert.throws(() => parseRuntimeJson(JSON.stringify({ identity, rootfs_path: "/tmp/rootfs" })), /identity.mode/);
+	identity.mode = "frozen-rootfs";
+	assert.throws(() => parseRuntimeJson(JSON.stringify({ identity, rootfs_path: "relative/rootfs" })), /absolute/);
+});
+
+test("frozen sandbox mounts the rootfs and scratch tmp while host mode keeps legacy mounts", {
+	skip: !existsSync("/usr/bin/bash") || !existsSync("/usr/bin/rg"),
+}, async () => {
+	const fixture = await createFrozenRuntimeFixture();
+	try {
+		const validated = validateRuntimeDescriptor(fixture.descriptor);
+		const scratch = join(fixture.root, "scratch");
+		const baseSandbox = {
+			workspace: join(fixture.root, "workspace"),
+			corpus: join(fixture.root, "workspace/corpus"),
+			bwrap: "/usr/bin/bwrap",
+			rg: "/usr/bin/rg",
+		} satisfies CorpusSandbox;
+		const frozen = sandboxArgs({ ...baseSandbox, runtime: validated }, scratch, "true");
+		const frozenRootBind = frozen.indexOf("--ro-bind");
+		assert.equal(frozen[frozenRootBind + 1], validated.rootfs_path);
+		assert.equal(frozen[frozenRootBind + 2], "/");
+		assert.ok(!frozen.some((value, index) => value === "/usr/bin" && frozen[index - 1] === "--ro-bind"));
+		assert.ok(frozen.includes(join(scratch, "tmp")));
+		assert.equal(frozen[frozen.indexOf("TMPDIR") + 1], "/tmp");
+		assert.equal(frozen[frozen.indexOf("PATH") + 1], "/usr/bin:/bin");
+
+		const host = sandboxArgs({ ...baseSandbox, runtime: undefined }, scratch, "true");
+		assert.ok(host.some((value, index) => value === "/usr/bin" && host[index - 1] === "--ro-bind"));
+		assert.ok(host.some((value, index) => value === "/usr/bin/rg" && host[index - 1] === "--ro-bind"));
+		assert.equal(host[host.indexOf("TMPDIR") + 1], "/scratch/tmp");
+	} finally {
+		await rm(fixture.root, { recursive: true, force: true });
+	}
+});
+
+test("v2 frozen rootfs runs rootfs tools and preserves read evidence", {
+	skip: !process.env.DCI_TEST_FROZEN_RUNTIME_JSON || !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const runtime = parseRuntimeJson(process.env.DCI_TEST_FROZEN_RUNTIME_JSON!);
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "bash", arguments: { command: "rg -q Relevant /workspace/corpus/doc.md && touch /tmp/probe && test -f /scratch/tmp/probe" }, usage: { input: 10, output: 1 } },
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 10, output: 1 } },
+		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } },
+	], undefined, "30", runtime);
+	assert.equal(result.valid_output, true);
+	assert.deepEqual(result.agent_runtime, runtime.identity);
+	assert.deepEqual(result.trace?.agent_runtime, runtime.identity);
+	assert.equal(result.body_evidence?.read_receipts?.length, 1);
 });
 
 test("v2 dynamic reserve funds only final and one repair from current history", () => {
