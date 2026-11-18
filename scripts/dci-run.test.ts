@@ -36,7 +36,8 @@ type StageTiming = {
 	bash_wall_seconds?: unknown;
 	bash_calls?: unknown;
 };
-type ControlEvent = { remaining_seconds?: unknown };
+type ControlEvent = { remaining_seconds?: unknown; action?: string; turn?: number; remaining_tokens?: number;
+	forecast?: { finalReserve: number; requiredReadReserve: number; reserve: number } };
 type RunnerResult = Record<string, unknown> & {
 	failure?: { kind?: string } | null;
 	contract?: { sample_timeout_seconds?: unknown };
@@ -375,9 +376,17 @@ test("bridge adapter blocks disabled tools and normalizes pseudo tool responses"
 			choices: [{ message: { content: '<think>reasoning</think>{"name":"read","arguments":{"path":"doc.md"}}' }, finish_reason: "stop" }],
 			usage: { prompt_tokens: 10, completion_tokens: 2 },
 		},
+		{
+			choices: [{ message: { content: '<tool_call><function=read><parameter=path>doc.md</parameter></function></tool_call>' }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 10, completion_tokens: 2 },
+		},
 	];
 	let responseIndex = 0;
-	const server = createServer(async (_request, response) => {
+	const requests: Record<string, unknown>[] = [];
+	const server = createServer(async (request, response) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(Buffer.from(chunk));
+		requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
 		response.setHeader("content-type", "application/json");
 		response.end(JSON.stringify(responses[responseIndex++]));
 	});
@@ -406,6 +415,15 @@ test("bridge adapter blocks disabled tools and normalizes pseudo tool responses"
 		const pseudoTool = pseudoMessage.content.find((part) => part.type === "toolCall");
 		assert.equal(pseudoTool?.type, "toolCall");
 		if (pseudoTool?.type === "toolCall") assert.deepEqual(pseudoTool.arguments, { path: "doc.md" });
+
+		const xml = await createBridgeStreamFn(config)(model, { messages: [] }, { toolChoice: "none" });
+		const xmlMessage = await xml.result();
+		assert.equal(xmlMessage.content.find((part) => part.type === "toolCall"), undefined);
+		assert.match(xmlMessage.content[0]?.type === "text" ? xmlMessage.content[0].text : "", /<tool_call>/);
+		for (const index of [0, 2]) {
+			assert.equal(requests[index].tool_choice, "none");
+			assert.deepEqual(requests[index].tools, []);
+		}
 	} finally {
 		server.closeAllConnections();
 		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -577,17 +595,84 @@ test("v2 frozen rootfs runs rootfs tools and preserves read evidence", {
 	assert.equal(result.body_evidence?.read_receipts?.length, 1);
 });
 
-test("v2 dynamic reserve funds only final and one repair from current history", () => {
+test("v2 looks ahead through another search, tool growth, final and repair prompts", () => {
 	const assistant = fauxAssistantMessage("read");
 	assistant.usage = { ...assistant.usage, input: 5000, output: 100, totalTokens: 5100 };
 	const context: Context = { messages: [
 		assistant,
 		{ role: "toolResult", toolCallId: "read", toolName: "read", content: [{ type: "text", text: "正文😀" }], isError: false, timestamp: 0 },
 	] };
-	const reserve = estimateBudgetReserve(context, { reserve_tokens: 0, dynamic_reserve: true });
-	assert.ok(reserve.reserve > 0);
-	assert.ok(reserve.reserve < 58432);
-	assert.ok(reserve.reserve < 64000);
+	const policy = { reserve_tokens: 0, dynamic_reserve: true,
+		final_prompt: "final 正文", final_repair_prompt: "repair", read_prompt: "read" };
+	const forecast = estimateBudgetReserve(context, policy);
+	assert.equal(forecast.nextInput, 5110);
+	const final = 5110 + Buffer.byteLength(policy.final_prompt) + 1024 + 4096;
+	const repair = final + 1024 + Buffer.byteLength(policy.final_repair_prompt);
+	assert.equal(forecast.finalReserve, final + repair);
+	assert.equal(forecast.reserve, forecast.nextRequest + final + repair + 2 * (1024 + forecast.toolGrowth));
+	// The old condition allowed a search here although its subsequent final/repair could not fit.
+	assert.ok(forecast.finalReserve! < 36325);
+	assert.ok(forecast.reserve > 36325);
+	const unread = estimateBudgetReserve(context, policy, { needsRead: true });
+	assert.equal(unread.reserve, forecast.nextRequest + unread.requiredReadReserve! + 3 * (1024 + forecast.toolGrowth));
+	assert.ok(unread.reserve > forecast.reserve);
+	const resumed = estimateBudgetReserve(context, policy, { continuationPrompt: "resume" });
+	assert.equal(resumed.reserve - forecast.reserve, 3 * Buffer.byteLength("resume"));
+	const diagnostic = documentIdIssue({ ranked_doc_ids: ["unknown".repeat(1000)] }, corpusDocumentIds(["doc.md"]))!;
+	assert.equal(Buffer.byteLength(diagnostic), 4000);
+	const rendered = estimateBudgetReserve(context, { ...policy,
+		final_prompt: "final {reason}", final_repair_prompt: "repair {reason}", read_prompt: "read {remaining_tokens}" });
+	const finalBytes = Buffer.byteLength("final remaining budget reserved for final submission");
+	assert.equal(rendered.finalReserve, 2 * (5110 + finalBytes + 5120) + 1024 + Buffer.byteLength(`repair ${diagnostic}`));
+});
+
+test("v2 finalizes before an extra search and repairs XML without executing it", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md", limit: 3 }, usage: { input: 12000, output: 1 } },
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 13000, output: 1 } },
+		{ type: "final", text: '<tool_call><function=bash><parameter=command>echo unwanted</parameter></function></tool_call>', usage: { input: 14000, output: 100 } },
+		{ type: "final", text: '{"ranked_doc_ids":["doc"]}', usage: { input: 15000, output: 10 } },
+	], "96000");
+	assert.equal(result.valid_output, true);
+	assert.equal(result.agent_steps, 4);
+	assert.equal(result.repair_attempts, 1);
+	assert.equal(result.tool_invocations, 2);
+	assert.equal(result.trace?.events?.filter((event) => event.type === "tool_execution_start" && event.toolName === "bash").length, 0);
+	const final = result.trace?.control_events?.find((event) => event.action === "finalize");
+	assert.equal(final?.turn, 2);
+	assert.ok(final!.remaining_tokens! > final!.forecast!.finalReserve);
+	assert.ok(final!.remaining_tokens! < final!.forecast!.reserve);
+});
+
+test("v2 requests evidence early and can finalize plus repair inside 32k", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "bash", arguments: { command: "ls /workspace/corpus" }, usage: { input: 2000, output: 10 } },
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 3000, output: 10 } },
+		{ type: "final", text: "not-json", usage: { input: 4000, output: 10 } },
+		{ type: "final", text: '{"ranked_doc_ids":["doc"]}', usage: { input: 5000, output: 10 } },
+	], "32000");
+	assert.equal(result.valid_output, true);
+	assert.equal(result.repair_attempts, 1);
+	assert.equal(result.usage_summary?.total_model_tokens, 14040);
+	assert.deepEqual(result.trace?.control_events?.map((event) => [event.action, event.turn]), [["require_read", 1], ["finalize", 2]]);
+});
+
+test("v2 does not count a repair blocked by the pre-dispatch token guard", {
+	skip: !existsSync("/usr/bin/bwrap"),
+}, async () => {
+	const result = await runV2Mock([
+		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 12000, output: 1 } },
+		{ type: "final", text: "not-json", usage: { input: 10000, output: 100 } },
+	], "32000");
+	assert.equal(result.valid_output, false);
+	assert.equal(result.failure?.kind, "token_limit");
+	assert.equal(result.agent_steps, 2);
+	assert.equal(result.repair_attempts, 0);
+	assert.deepEqual(result.repair_reasons, []);
 });
 
 test("v2 stops after twelve search assistant turns and preserves a final turn", {
@@ -651,7 +736,7 @@ test("v2 reports monotonic sandbox and bash stage timing", {
 		{ type: "tool_call", name: "bash", arguments: { command: "true" }, usage: { input: 10, output: 1 } },
 		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 10, output: 1 } },
 		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } },
-	]);
+	], "96000");
 	assert.equal(result.valid_output, true);
 	const timing = result.stage_timing;
 	assert.ok(timing);
@@ -675,7 +760,8 @@ test("v2 required read consumes one of twelve search turns before finalization",
 		steps.push({ type: "tool_call", name: "bash", arguments: { command: `true # post-read-${index}` }, usage: { input: 10, output: 1 } });
 	}
 	steps.push({ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } });
-	const result = await runV2Mock(steps);
+	// Leave enough budget to exercise the turn cap rather than early budget finalization.
+	const result = await runV2Mock(steps, "96000");
 	assert.equal(result.valid_output, true);
 	assert.equal(result.search_turns, 12);
 	assert.equal(result.tool_invocations, 12);
@@ -722,12 +808,15 @@ test("v2 reports a cumulative token overrun before final acceptance", {
 	assert.equal(result.failure?.kind, "token_limit");
 });
 
-test("v2 low calibration budget finalizes or returns a structured token failure", {
+test("v2 refuses finalization when one unexpectedly expensive read exhausts the budget", {
 	skip: !existsSync("/usr/bin/bwrap"),
 }, async () => {
 	const result = await runV2Mock([
 		{ type: "tool_call", name: "read", arguments: { path: "doc.md" }, usage: { input: 27000, output: 1 } },
 		{ type: "final", text: JSON.stringify({ ranked_doc_ids: ["doc"] }), usage: { input: 10, output: 1 } },
 	], "32000");
-	assert.ok(result.valid_output === true || result.failure?.kind === "token_limit");
+	assert.equal(result.valid_output, false);
+	assert.equal(result.failure?.kind, "token_limit");
+	assert.equal(result.agent_steps, 1);
+	assert.equal(result.repair_attempts, 0);
 });

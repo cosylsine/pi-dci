@@ -32,6 +32,8 @@ import {
 } from "./adapters/inspect-bridge.ts";
 export { createBridgeStreamFn, parseUsage } from "./adapters/inspect-bridge.ts";
 import { parseRuntimeJson, type FrozenRuntimeDescriptor, validateRuntimeDescriptor } from "./dci-runtime.ts";
+import { createTokenCounter } from "./adapters/token-count.ts";
+import { forecastTokenBudget, V2_FINAL_ISSUES } from "./adapters/budget.ts";
 
 type CanonicalToolDefinition = {
 	name: string;
@@ -44,6 +46,7 @@ type BudgetControlPolicy = {
 	version: string;
 	reserve_tokens: number;
 	dynamic_reserve?: boolean;
+	tokenizer_reserve?: boolean;
 	forecast_bytes_per_token?: number;
 	forecast_request_safety_tokens?: number;
 	repeat_threshold: number;
@@ -996,15 +999,18 @@ export function corpusDocumentIds(filenames: string[]): { ids: Set<string>; alia
 	return { ids, aliases };
 }
 
+const MAX_FINAL_DIAGNOSTIC_BYTES = 4000;
+
 export function documentIdIssue(parsed: ParsedFinal, corpusIds: ReturnType<typeof corpusDocumentIds>): string | undefined {
 	const unknown = parsed.ranked_doc_ids.filter((id) => !corpusIds.ids.has(id));
 	if (!unknown.length) return undefined;
+	if (DEFAULT_CONTRACT.budget_control?.tokenizer_reserve) return V2_FINAL_ISSUES[2];
 	const hints = unknown.flatMap((id) => {
 		const original = corpusIds.aliases.get(id);
 		return original === undefined ? [] : [{ submitted: id, doc_id: original }];
 	});
 	return truncate(`Unknown original document IDs: ${JSON.stringify(unknown)}. ` +
-		`Exact filename-to-doc_id mappings: ${JSON.stringify(hints)}. Copy original doc_id values; do not submit filenames.`, 4000);
+		`Exact filename-to-doc_id mappings: ${JSON.stringify(hints)}. Copy original doc_id values; do not submit filenames.`, MAX_FINAL_DIAGNOSTIC_BYTES);
 }
 
 function workspaceRelativePath(workspace: string, path: string): string {
@@ -1422,6 +1428,7 @@ function createModel(provider: Args["modelProvider"], id: string, baseUrl: strin
 }
 
 const CONTEXT_SAFETY_TOKENS = 4096;
+const LOW_BUDGET_FINAL_REASON = "remaining budget reserved for final submission";
 
 function estimateNextInputTokens(context: Context, conservative = false, bytesPerToken = 1): number {
 	let lastUsageIndex = -1;
@@ -1447,7 +1454,8 @@ function estimateNextInputTokens(context: Context, conservative = false, bytesPe
 
 export function estimateBudgetReserve(context: Context, policy: Pick<BudgetControlPolicy,
 	"reserve_tokens" | "forecast_bytes_per_token" | "forecast_request_safety_tokens"> &
-	Partial<Pick<BudgetControlPolicy, "dynamic_reserve">>) {
+	Partial<Pick<BudgetControlPolicy, "dynamic_reserve" | "final_prompt" | "final_repair_prompt" | "read_prompt">>,
+	{ needsRead = false, continuationPrompt = "" } = {}) {
 	// Defaults preserve the v5 control arm exactly. Calibration affects only
 	// early finalization, never the conservative pre-dispatch or actual-usage guards.
 	const bytesPerToken = policy.forecast_bytes_per_token ?? 1;
@@ -1460,14 +1468,33 @@ export function estimateBudgetReserve(context: Context, policy: Pick<BudgetContr
 	const nextRequest = nextInput + requestOverhead;
 	const toolGrowth = Math.ceil(DEFAULT_CONTRACT.tool_result_max_bytes / bytesPerToken);
 	let reserve: number;
+	let finalReserve: number | undefined;
+	let requiredReadReserve: number | undefined;
 	if (policy.dynamic_reserve) {
-		// V2 reserves only the final submission and one repair from the current
-		// history. The reserve is a threshold inside the cumulative budget; it is
-		// never added to actual usage. A final response becomes repair history, so
-		// include one output allowance in the repair request input estimate.
-		const finalRequest = nextInput + requestOverhead;
-		const repairRequest = nextInput + DEFAULT_CONTRACT.max_model_output_tokens + requestOverhead;
-		reserve = Math.max(policy.reserve_tokens, finalRequest + repairRequest);
+		// Decide whether ANOTHER search is affordable, not merely whether we can
+		// finalize now. Replay the new output, tool result and control prompts in
+		// every later request. These forecasts never add to measured token usage.
+		const output = DEFAULT_CONTRACT.max_model_output_tokens;
+		// Use rendered prompt bounds: the low-budget reason is the longest
+		// finalization reason, and ID diagnostics are capped at 4000 UTF-8 bytes.
+		const remainingDigits = String(DEFAULT_CONTRACT.max_total_model_tokens);
+		const finalPrompt = Math.ceil(Buffer.byteLength((policy.final_prompt ?? "")
+			.replace("{reason}", LOW_BUDGET_FINAL_REASON).replace("{remaining_tokens}", remainingDigits), "utf8") / bytesPerToken);
+		const repairPrompt = Math.ceil(Buffer.byteLength((policy.final_repair_prompt ?? "")
+			.replace("{reason}", " ".repeat(MAX_FINAL_DIAGNOSTIC_BYTES)), "utf8") / bytesPerToken);
+		const readPrompt = Math.ceil(Buffer.byteLength((policy.read_prompt ?? "")
+			.replace("{remaining_tokens}", remainingDigits), "utf8") / bytesPerToken);
+		const continuation = Math.ceil(Buffer.byteLength(continuationPrompt, "utf8") / bytesPerToken);
+		finalReserve = (nextInput + finalPrompt + requestOverhead) +
+			(nextInput + finalPrompt + output + repairPrompt + requestOverhead);
+		const readGrowth = readPrompt + output + toolGrowth;
+		requiredReadReserve = nextInput + readPrompt + requestOverhead + finalReserve + 2 * readGrowth;
+		const searchGrowth = continuation + output + toolGrowth;
+		// Without body evidence, preserve a read before final/repair as well.
+		// One capped tool result per future turn is a forecast, not a guarantee
+		// for arbitrary tool arrays; observed usage and dispatch guards still apply.
+		reserve = Math.max(policy.reserve_tokens, nextRequest + continuation +
+			(needsRead ? requiredReadReserve + 3 * searchGrowth : finalReserve + 2 * searchGrowth));
 	} else {
 		// Preserve the v5 control arm exactly: reserve one search/read, final
 		// submission and one repair, including the next tool result replay.
@@ -1476,7 +1503,8 @@ export function estimateBudgetReserve(context: Context, policy: Pick<BudgetContr
 			nextRequest + (afterSearchInput + requestOverhead) +
 			(afterSearchInput + DEFAULT_CONTRACT.max_model_output_tokens + requestOverhead));
 	}
-	return { nextInput, nextRequest, toolGrowth, safetyTokens, bytesPerToken, reserve };
+	return { nextInput, nextRequest, toolGrowth, safetyTokens, bytesPerToken, reserve,
+		...(policy.dynamic_reserve ? { finalReserve, requiredReadReserve } : {}) };
 }
 
 function failureFromAgentError(message: string): StructuredFailure {
@@ -1586,6 +1614,7 @@ async function main() {
 	}
 
 	const scratch = await mkdtemp(join(tmpdir(), "dci-bench-sample-"));
+	let tokenCounter: ReturnType<typeof createTokenCounter> | undefined;
 	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 	let onTerminate: (() => void) | undefined;
 	const output = resolve(args.output);
@@ -1607,6 +1636,7 @@ async function main() {
 		const corpusIds = codeFiles ? undefined : corpusDocumentIds(await readdir(sandbox.corpus));
 		const repairReasons: string[] = [];
 		const budgetPolicy = DEFAULT_CONTRACT.budget_control;
+		if (budgetPolicy?.tokenizer_reserve && args.modelProvider !== "mock") tokenCounter = createTokenCounter();
 		const bashTiming: BashTiming | undefined = isV2 ? { wallSeconds: 0, calls: 0 } : undefined;
 		const stageTiming = isV2 ? () => ({
 			sandbox_validate_seconds: sandboxValidateSeconds,
@@ -1615,6 +1645,8 @@ async function main() {
 			bash_calls: bashTiming!.calls,
 		}) : undefined;
 		const controlEvents: Array<Record<string, unknown>> = [];
+		const tokenChecks: Array<Record<string, unknown>> = [];
+		let dispatchedInput: number | undefined;
 		let finalizing = false;
 		let requiringRead = false;
 		let requiredReadTurns = 0;
@@ -1635,6 +1667,7 @@ async function main() {
 				seed: DEFAULT_CONTRACT.generation_config.seed,
 				enableThinking: DEFAULT_CONTRACT.generation_config.enable_thinking,
 				contextPreflight: (currentModel, context) => {
+					if (tokenCounter) return; // Exact dispatch guard runs for every request below.
 					const estimatedInputTokens = estimateNextInputTokens(context);
 					if (
 						estimatedInputTokens + DEFAULT_CONTRACT.max_model_output_tokens + CONTEXT_SAFETY_TOKENS >
@@ -1651,10 +1684,23 @@ async function main() {
 		const readTool = codeFiles ? createCodeReadTool(sandbox, evidence) : createReadTool(sandbox, evidence);
 		const searchTools = [readTool, createBashTool(sandbox, scratch, evidence, bashTiming)];
 		const agent = new Agent({
-			streamFn: (currentModel, context, options) =>
-				baseStreamFn(currentModel, context, {
+			streamFn: async (currentModel, context, options) => {
+				if (tokenCounter) {
+					dispatchedInput = await tokenCounter.count(context);
+					const required = dispatchedInput + DEFAULT_CONTRACT.max_model_output_tokens;
+					const remaining = DEFAULT_CONTRACT.max_total_model_tokens - totalModelTokens;
+					tokenChecks.push({ turn: turns + 1, predicted_input: dispatchedInput, remaining_tokens: remaining,
+						source: tokenCounter.source, dispatched: required <= remaining && required <= currentModel.contextWindow });
+					if (required > remaining || required > currentModel.contextWindow) {
+						structuredFailure = makeFailure(required > remaining ? "token_limit" : "context_overflow",
+							`tokenized input ${dispatchedInput} plus output cap ${DEFAULT_CONTRACT.max_model_output_tokens} cannot fit`);
+						throw new Error(structuredFailure!.message);
+					}
+				}
+				return baseStreamFn(currentModel, context, {
 					...options, ...(finalizing ? { toolChoice: "none" as const } : {}),
-				}),
+				});
+			},
 			initialState: {
 				systemPrompt: DEFAULT_CONTRACT.system_prompt,
 				model,
@@ -1681,6 +1727,14 @@ async function main() {
 					return true;
 				}
 				totalModelTokens += currentUsage.value.totalTokens;
+				if (tokenCounter && dispatchedInput !== undefined) {
+					Object.assign(tokenChecks[tokenChecks.length - 1], { actual_input: currentUsage.value.input,
+						input_delta: currentUsage.value.input - dispatchedInput });
+					if (currentUsage.value.input !== dispatchedInput) {
+						structuredFailure = makeFailure("agent_error", `tokenizer/usage mismatch: predicted ${dispatchedInput}, actual ${currentUsage.value.input}`);
+						return true;
+					}
+				}
 				if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
 					structuredFailure = makeFailure("timeout", "sample wall deadline reached before final acceptance");
 					return true;
@@ -1724,10 +1778,18 @@ async function main() {
 						lastToolSignature = signature;
 					}
 					const remaining = DEFAULT_CONTRACT.max_total_model_tokens - totalModelTokens;
-					const forecast = estimateBudgetReserve({ ...context, messages: context.messages.filter((item): item is Message =>
-						item.role === "assistant" || item.role === "user" || item.role === "toolResult") }, budgetPolicy);
-					const { nextRequest, reserve } = forecast;
 					const hasEvidence = hasBodyEvidence(evidence);
+					const countedContext = { ...context, tools: searchTools, messages: context.messages.filter((item): item is Message =>
+						item.role === "assistant" || item.role === "user" || item.role === "toolResult") };
+					const forecastOptions = {
+						needsRead: !hasEvidence,
+						continuationPrompt: requiringRead && hasEvidence
+							? budgetPolicy.resume_prompt.replace("{remaining_tokens}", String(remaining)) : "",
+					};
+					const forecast = tokenCounter ? await forecastTokenBudget(countedContext, budgetPolicy, tokenCounter.count,
+						{ ...forecastOptions, remaining, futureToolResults: Math.max(1, calls.length) })
+						: estimateBudgetReserve(countedContext, budgetPolicy, forecastOptions);
+					const { nextRequest, reserve } = forecast;
 					const repeating = calls.length > 0 && identicalCalls >= budgetPolicy.repeat_threshold;
 					const lowBudget = remaining <= reserve;
 					const remainingSeconds = deadlineAt === undefined ? null : Math.max(0, (deadlineAt - Date.now()) / 1000);
@@ -1764,7 +1826,7 @@ async function main() {
 						return true;
 					}
 					if (hasEvidence && (repeating || lowBudget)) {
-						const reason = repeating ? "identical tool calls repeated" : "remaining budget reserved for final submission";
+						const reason = repeating ? "identical tool calls repeated" : LOW_BUDGET_FINAL_REASON;
 						requiringRead = false;
 						finalizing = true;
 						pendingControl = budgetPolicy.final_prompt.replace("{reason}", reason).replace("{remaining_tokens}", String(remaining));
@@ -1819,6 +1881,7 @@ async function main() {
 				schema_version: DEFAULT_CONTRACT.trajectory_schema_version,
 				contract_version: DEFAULT_CONTRACT.benchmark_contract_version,
 				protocol_profile: PROTOCOL_PROFILE, base_contract_sha256: CONTRACT_SHA256, control_events: controlEvents,
+				token_checks: tokenChecks,
 				started_at: startedAt, updated_at: new Date().toISOString(), partial: true,
 				inspect_sandbox: "local", tool_sandbox: "bubblewrap",
 				...(runtime ? { agent_runtime: runtime.identity } : {}),
@@ -1841,7 +1904,7 @@ async function main() {
 			}
 			if (event.type !== "message_update") persistTrace();
 		});
-		const promptWithControls = async (prompt: string) => {
+		const promptWithControls = async (prompt: string, repairReason?: string) => {
 			let nextPrompt: string | undefined = prompt;
 			while (nextPrompt && !structuredFailure) {
 				pendingControl = undefined;
@@ -1852,17 +1915,24 @@ async function main() {
 				// Restrict execution as well as the advertised tools: a backend that
 				// ignores the requested tool choice must not resume bash searches.
 				agent.state.tools = finalizing ? [] : requiringRead ? [readTool] : searchTools;
-				if (budgetPolicy && totalModelTokens > 0) {
-					const messages = agent.state.messages.filter((item): item is Message =>
-						item.role === "assistant" || item.role === "user" || item.role === "toolResult");
-					const estimated = estimateNextInputTokens({ messages }, true) + Buffer.byteLength(nextPrompt, "utf8") +
-						DEFAULT_CONTRACT.max_model_output_tokens + CONTEXT_SAFETY_TOKENS;
-					if (estimated >= DEFAULT_CONTRACT.max_total_model_tokens - totalModelTokens) {
-						structuredFailure = makeFailure("token_limit", "remaining cumulative budget cannot safely fund finalization or repair");
-						break;
-					}
-				}
 				try {
+					if (budgetPolicy && totalModelTokens > 0) {
+						const messages = agent.state.messages.filter((item): item is Message =>
+							item.role === "assistant" || item.role === "user" || item.role === "toolResult");
+						const estimated = tokenCounter ? await tokenCounter.count({ systemPrompt: agent.state.systemPrompt,
+							tools: agent.state.tools, messages: [...messages, { role: "user", content: nextPrompt, timestamp: 0 }] }) +
+							DEFAULT_CONTRACT.max_model_output_tokens : estimateNextInputTokens({ messages }, true) + Buffer.byteLength(nextPrompt, "utf8") +
+							DEFAULT_CONTRACT.max_model_output_tokens + CONTEXT_SAFETY_TOKENS;
+						if (estimated > DEFAULT_CONTRACT.max_total_model_tokens - totalModelTokens) {
+							structuredFailure = makeFailure("token_limit", "remaining cumulative budget cannot safely fund finalization or repair");
+							break;
+						}
+					}
+					// A repair blocked by the deadline or token guard was not attempted.
+					if (repairReason !== undefined) {
+						repairReasons.push(repairReason);
+						repairReason = undefined;
+					}
 					await agent.prompt(nextPrompt);
 				} catch (error) {
 					structuredFailure ??= failureFromAgentError(String(error));
@@ -1893,8 +1963,7 @@ async function main() {
 			turns < args.maxAgentSteps &&
 			repairReasons.length < DEFAULT_CONTRACT.max_final_repair_turns
 		) {
-			repairReasons.push(finalIssue);
-			await promptWithControls(buildRepairPrompt(finalIssue, finalizing));
+			await promptWithControls(buildRepairPrompt(finalIssue, finalizing), finalIssue);
 			const repairAssistantMessages = agent.state.messages.filter(
 				(message): message is AssistantMessage => message.role === "assistant",
 			);
@@ -1930,6 +1999,7 @@ async function main() {
 			protocol_profile: PROTOCOL_PROFILE,
 			base_contract_sha256: CONTRACT_SHA256,
 			control_events: controlEvents,
+			token_checks: tokenChecks,
 			started_at: startedAt,
 			completed_at: completedAt,
 			valid_output: acceptedParsed !== undefined,
@@ -2000,6 +2070,7 @@ async function main() {
 					protocol_profile: PROTOCOL_PROFILE,
 					base_contract_sha256: CONTRACT_SHA256,
 					control_events: controlEvents,
+					token_checks: tokenChecks,
 					task_instruction: taskInstruction,
 					started_at: startedAt,
 					completed_at: completedAt,
@@ -2019,6 +2090,7 @@ async function main() {
 			process.exitCode = 2;
 		}
 	} finally {
+		tokenCounter?.close();
 		if (deadlineTimer) clearTimeout(deadlineTimer);
 		if (onTerminate) { process.off("SIGTERM", onTerminate); process.off("SIGINT", onTerminate); }
 		await rm(scratch, { recursive: true, force: true });

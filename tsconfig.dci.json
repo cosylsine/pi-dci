@@ -1,5 +1,5 @@
 {
 	"extends": "./tsconfig.json",
-	"include": ["scripts/dci-run.ts", "scripts/dci-run.test.ts", "scripts/dci-code-run.test.ts", "scripts/dci-frozen-sandbox.test.ts", "scripts/adapters/**/*.ts"],
+	"include": ["scripts/dci-run.ts", "scripts/dci-run.test.ts", "scripts/token-budget.test.ts", "scripts/dci-code-run.test.ts", "scripts/dci-frozen-sandbox.test.ts", "scripts/adapters/**/*.ts"],
 	"exclude": []
 }
